@@ -1,0 +1,73 @@
+{
+  "name": "sentinel-scrape-worker",
+  "description": "Sentinel scrape worker (Playwright + FastAPI). Classic buildpacks — not Docker.",
+  "repository": "",
+  "keywords": ["fastapi", "playwright", "scraper", "sentinel"],
+  "stack": "heroku-24",
+  "buildpacks": [
+    {
+      "url": "https://github.com/heroku/heroku-buildpack-apt"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "env": {
+    "WORKER_ID": {
+      "description": "Unique worker id for this dyno",
+      "value": "scrape-worker-1"
+    },
+    "WORKER_SHARED_TOKEN": {
+      "description": "Shared bearer token (must match coordinator)",
+      "required": true
+    },
+    "COORDINATOR_URL": {
+      "description": "Coordinator / license-registry base URL (https://…)",
+      "required": true
+    },
+    "WORKER_PUBLIC_URL": {
+      "description": "This Heroku app’s public https URL (set after first deploy if needed)",
+      "required": false
+    },
+    "WORKER_REGISTRATION_OPEN": {
+      "description": "1 = self-register with coordinator on boot",
+      "value": "1"
+    },
+    "WORKER_CAPACITY": {
+      "description": "Reported capacity; keep 1 on small dynos",
+      "value": "1"
+    },
+    "WORKER_ALLOWED_SOURCES": {
+      "value": "*"
+    },
+    "SCRAPER_MODE": {
+      "value": "embedded"
+    },
+    "SCRAPER_ROOT": {
+      "value": "/app"
+    },
+    "PLAYWRIGHT_BROWSERS_PATH": {
+      "description": "Must match bin/post_compile install path",
+      "value": "/app/.playwright"
+    },
+    "OPENAI_API_KEY": {
+      "description": "Optional; required only for LLM scrape mode",
+      "required": false
+    },
+    "YOUTUBE_MAX_LIVE_AGE_HOURS": {
+      "value": "24"
+    },
+    "LOG_LEVEL": {
+      "value": "info"
+    }
+  },
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "standard-1x"
+    }
+  },
+  "scripts": {
+    "postdeploy": "echo 'Set WORKER_PUBLIC_URL to https://$HEROKU_APP_NAME.herokuapp.com if unset'"
+  }
+}

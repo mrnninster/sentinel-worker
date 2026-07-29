@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel-scrape-worker"
+version = "1.0.0"
+description = "Sentinel scrape worker with embedded schedule scraper (Playwright + LLM)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.22.0",
+  "pydantic>=2.0.0",
+  "pydantic-settings>=2.0.0",
+  "python-dotenv>=1.0.0",
+  "beautifulsoup4>=4.12.2",
+  "playwright>=1.40.0",
+  "openai>=1.40.0",
+  "httpx>=0.24.1",
+  "python-dateutil>=2.9.0",
+  "pytz>=2024.1",
+]
+
+[project.scripts]
+schedule-scraper = "app.__main__:main"
+schedule-scrape-page = "app.cli_scrape:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]

@@ -1,0 +1,41 @@
+# Blueprint for the Sentinel scrape worker (standalone repo root = this folder).
+# Free tier: create the Web Service manually if Blueprint is unavailable.
+#
+# Required secrets (set in Render dashboard — sync: false):
+#   WORKER_SHARED_TOKEN  — must match coordinator
+#   COORDINATOR_URL      — e.g. https://sentinel-license-registry.onrender.com
+#   WORKER_PUBLIC_URL    — this service’s public https URL
+#   OPENAI_API_KEY       — optional; only if LLM scrape mode is used
+
+services:
+  - type: web
+    name: sentinel-scrape-worker-1
+    runtime: docker
+    plan: starter
+    region: oregon
+    branch: master
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: WORKER_ID
+        value: scrape-worker-1
+      - key: WORKER_SHARED_TOKEN
+        sync: false
+      - key: COORDINATOR_URL
+        sync: false
+      - key: WORKER_PUBLIC_URL
+        sync: false
+      - key: WORKER_CAPACITY
+        value: "1"
+      - key: WORKER_ALLOWED_SOURCES
+        value: "*"
+      - key: WORKER_REGISTRATION_OPEN
+        value: "1"
+      - key: SCRAPER_MODE
+        value: embedded
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /ms-playwright
+      - key: OPENAI_API_KEY
+        sync: false

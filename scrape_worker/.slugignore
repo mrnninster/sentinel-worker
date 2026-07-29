@@ -1,0 +1,15 @@
+# Keep the Heroku slug small — this directory is the GitHub / Heroku app root.
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.git/
+Dockerfile
+heroku.yml
+render.yaml
+*.md
+!README.md
