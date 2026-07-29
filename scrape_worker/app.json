@@ -46,7 +46,7 @@
       "value": "1"
     },
     "RESERVE_TRANSCRIPT": {
-      "description": "Slots reserved for transcripts (accounting only)",
+      "description": "Slots reserved for transcript PDF jobs",
       "value": "1"
     },
     "DISPATCH_MODE": {
@@ -67,6 +67,10 @@
     },
     "INTERNAL_CALLBACK_TOKEN": {
       "description": "Bearer for job→middleman callbacks (defaults to WORKER_SHARED_TOKEN)",
+      "required": false
+    },
+    "TRANSCRIPTAPI_API_KEY": {
+      "description": "TranscriptAPI fallback token when YouTube Innertube is blocked",
       "required": false
     },
     "WORKER_ALLOWED_SOURCES": {

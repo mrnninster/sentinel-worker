@@ -1,4 +1,4 @@
-"""One-off / thread job entrypoint: run scrape or stream-status, POST callback."""
+"""One-off/thread entrypoint: scrape, stream-status, or transcript."""
 
 from __future__ import annotations
 
@@ -215,9 +215,30 @@ def run_job_from_env(env: Optional[dict[str, str]] = None) -> int:
                 callback_token=callback_token,
             )
             return 0
+        if job_type == "transcript":
+            from jobs.transcript import run_transcript_job
+
+            body = run_transcript_job(payload, source, worker_id)
+            _post_callback(callback_url, callback_token, body)
+            return 0
         raise ValueError(f"Unknown ARG_JOB_TYPE={job_type!r}")
     except Exception as exc:
         log.exception("Job failed type=%s job_id=%s", job_type, job_id)
+        coordinator_relayed = False
+        rate_limited = bool(getattr(exc, "rate_limited", False))
+        if job_type == "transcript":
+            from jobs.transcript import post_failure
+
+            post_failure(
+                url=str(payload.get("fail_url") or ""),
+                token=source.get("WORKER_SHARED_TOKEN") or source.get("WORKER_TOKEN") or "",
+                worker_id=worker_id,
+                meeting_id=payload.get("meeting_id"),
+                video_id=payload.get("video_id"),
+                error=str(exc),
+                rate_limited=rate_limited,
+            )
+            coordinator_relayed = True
         _post_callback(
             callback_url,
             callback_token,
@@ -227,6 +248,8 @@ def run_job_from_env(env: Optional[dict[str, str]] = None) -> int:
                 "load_type": job_type or "unknown",
                 "job_id": job_id,
                 "error": str(exc),
+                "rate_limited": rate_limited,
+                "coordinator_relayed": coordinator_relayed,
                 "terminal": True,
             },
             fail=True,

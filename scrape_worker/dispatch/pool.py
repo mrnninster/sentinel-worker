@@ -70,14 +70,16 @@ class DynoPool:
         return max(0, self.max_oneoff - self.reserve_scrape - self.reserve_transcript)
 
     def snapshot(self) -> dict[str, Any]:
-        load_by_type = {t: 0 for t in PRIORITY_ORDER}
         queued_by_type = {t: len(self.queues[t]) for t in PRIORITY_ORDER}
+        # `load` / `load_by_type` represent all accepted work. Command uses
+        # oneoff_running and queued_by_type separately for pool-fill math.
+        load_by_type = dict(queued_by_type)
         running_jobs: list[dict[str, str]] = []
         for job in self.running.values():
             load_by_type[job.load_type] = load_by_type.get(job.load_type, 0) + 1
             running_jobs.append({"job_id": job.job_id, "load_type": job.load_type})
         return {
-            "load": len(self.running),
+            "load": len(self.running) + sum(queued_by_type.values()),
             "capacity": self.max_oneoff,
             "oneoff_limit": self.max_oneoff,
             "oneoff_running": len(self.running),

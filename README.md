@@ -42,6 +42,7 @@ One `.env` in this directory (see `.env.example`). Important keys:
 | `HEROKU_API_KEY` / `HEROKU_APP_NAME` | Required on Heroku to spawn one-offs |
 | `HEROKU_DYNO_SIZE` | One-off size (`standard-1x` default) |
 | `INTERNAL_CALLBACK_TOKEN` | Job→middleman Bearer (defaults to shared token) |
+| `TRANSCRIPTAPI_API_KEY` | TranscriptAPI fallback when YouTube Innertube is blocked |
 | `WORKER_HEARTBEAT_SECONDS` | Periodic heartbeat interval (default `30`) |
 | `OPENAI_API_KEY` | Needed for LLM scrape mode |
 | `SCRAPER_MODE` | `embedded` (default) or `http` |
@@ -75,13 +76,13 @@ Example:
 {
   "worker_id": "scrape-worker-1",
   "reason": "heartbeat",
-  "load": 12,
+  "load": 14,
   "capacity": 50,
   "oneoff_limit": 50,
   "oneoff_running": 12,
   "load_by_type": {
     "scrape": 1,
-    "stream_status": 11,
+    "stream_status": 13,
     "transcript": 0
   },
   "queued_by_type": {
@@ -202,6 +203,38 @@ On hard failure: `POST …/jobs/{job_id}/fail` with `meeting_id`, `job_id`, `err
 
 Cancel: `POST {WORKER_PUBLIC_URL}/v1/commands/{job_id}/cancel`.
 
+### Transcript PDF
+
+**Command → worker**
+
+```http
+POST {WORKER_PUBLIC_URL}/v1/commands/transcript
+```
+
+```json
+{
+  "meeting_id": "austin-tx:e7l6sylixl0",
+  "video_id": "E7l6sYLIXl0",
+  "video_url": "https://www.youtube.com/watch?v=E7l6sYLIXl0",
+  "title": "City Council Regular Meeting",
+  "source_id": "austin-tx",
+  "callback_url": "https://registry.example.com/v1/workers/transcripts",
+  "fail_url": "https://registry.example.com/v1/workers/transcripts/fail"
+}
+```
+
+The worker returns `202`, then:
+
+1. requests YouTube's modern Innertube `get_panel` transcript;
+2. falls back to TranscriptAPI when YouTube is blocked or returns no cues;
+3. renders timestamped cues to a PDF;
+4. uploads the PDF as multipart form data to `callback_url`.
+
+Failures are posted to `fail_url` with `rate_limited: true` when an upstream
+returns HTTP 429. The internal one-off callback only releases the worker pool
+slot; Command continues to receive transcript PDF/failure on its dedicated
+transcript endpoints.
+
 ### YouTube scrape notes
 
 For `schedule_type=youtube_table` (+ optional `youtube_fallback`):
@@ -236,7 +269,8 @@ curl -s http://127.0.0.1:8080/scrape \
 ```text
 main.py                 Middleman FastAPI (commands / queue / relay)
 dispatch/               Pool, Heroku one-off + local thread spawners
-jobs/runner.py          One-off/thread entrypoint (scrape | stream_status)
+jobs/runner.py          One-off/thread entrypoint (scrape | stream_status | transcript)
+jobs/transcript.py      Innertube/TranscriptAPI retrieval + PDF upload
 scraper_bridge.py       embedded | http scrape bridge
 app/                    Schedule scrape FastAPI + LLM pipeline
 schedule/library/       Dedicated platform parsers

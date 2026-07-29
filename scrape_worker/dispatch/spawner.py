@@ -72,11 +72,25 @@ def build_job_env(job: QueuedJob) -> dict[str, str]:
         "LOG_LEVEL": (os.environ.get("LOG_LEVEL") or "info").strip(),
         "PYTHONUNBUFFERED": "1",
     }
+    worker_token = (
+        os.environ.get("WORKER_SHARED_TOKEN")
+        or os.environ.get("WORKER_TOKEN")
+        or ""
+    ).strip()
+    if worker_token:
+        env["WORKER_SHARED_TOKEN"] = worker_token
     if pw_path:
         env["PLAYWRIGHT_BROWSERS_PATH"] = pw_path
     openai = (os.environ.get("OPENAI_API_KEY") or "").strip()
     if openai:
         env["OPENAI_API_KEY"] = openai
+    transcript_api_key = (
+        os.environ.get("TRANSCRIPTAPI_API_KEY")
+        or os.environ.get("TRANSCRIPTAPI_KEY")
+        or ""
+    ).strip()
+    if transcript_api_key:
+        env["TRANSCRIPTAPI_API_KEY"] = transcript_api_key
     return env
 
 
