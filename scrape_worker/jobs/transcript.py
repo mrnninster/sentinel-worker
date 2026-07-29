@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from io import BytesIO
@@ -9,10 +10,6 @@ from typing import Any, Iterator
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from reportlab.lib.pagesizes import LETTER
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 log = logging.getLogger(__name__)
 
@@ -30,9 +27,17 @@ _PANEL_PARAMS_RE = re.compile(
 class TranscriptError(RuntimeError):
     """A transcript could not be fetched or uploaded."""
 
-    def __init__(self, message: str, *, rate_limited: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        rate_limited: bool = False,
+        reason: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.rate_limited = rate_limited
+        # Structured code for downstream filtering (e.g. "no_captions", "rate_limited").
+        self.reason = reason or ("rate_limited" if rate_limited else "error")
 
 
 def extract_video_id(video_id: str | None, video_url: str | None) -> str:
@@ -126,6 +131,18 @@ def _parse_panel_cues(data: dict[str, Any]) -> list[dict[str, Any]]:
     return cues
 
 
+def _build_panel_params(video_id: str) -> str:
+    """
+    Serialize the get_panel params proto: field 149 { 1: video_id, 3: 1 }.
+
+    Older watch pages only ship the legacy searchable-transcript endpoint, so the
+    modern params cannot always be scraped from the HTML.
+    """
+    inner = b"\x0a" + bytes([len(video_id)]) + video_id.encode("ascii") + b"\x18\x01"
+    raw = b"\xaa\x09" + bytes([len(inner)]) + inner
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
 def fetch_innertube_panel(video_id: str, *, timezone: str = "America/New_York") -> list[dict[str, Any]]:
     """Use the modern Show transcript get_panel request."""
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -147,42 +164,51 @@ def fetch_innertube_panel(video_id: str, *, timezone: str = "America/New_York") 
         visitor_data = visitor_match.group(1) if visitor_match else ""
         client_version = version_match.group(1) if version_match else "2.20260728.01.00"
 
-        panel_match = _PANEL_PARAMS_RE.search(watch.text)
-        if not panel_match:
-            raise TranscriptError("YouTube watch page did not expose transcript panel params")
-        # YouTube generates this protobuf/base64 value per page/video. Extract it
-        # from the Show transcript command instead of hard-coding client internals.
-        params = panel_match.group(1)
-        body = {
-            "context": {
-                "client": {
-                    "hl": "en",
-                    "gl": "US",
-                    "clientName": "WEB",
-                    "clientVersion": client_version,
-                    "visitorData": visitor_data,
-                    "userAgent": headers["User-Agent"],
-                    "platform": "DESKTOP",
-                    "timeZone": timezone,
-                },
-                "user": {"lockedSafetyMode": False},
-                "request": {"useSsl": True},
+        context = {
+            "client": {
+                "hl": "en",
+                "gl": "US",
+                "clientName": "WEB",
+                "clientVersion": client_version,
+                "visitorData": visitor_data,
+                "userAgent": headers["User-Agent"],
+                "platform": "DESKTOP",
+                "timeZone": timezone,
             },
-            "panelId": "PAmodern_transcript_view",
-            "params": params,
+            "user": {"lockedSafetyMode": False},
+            "request": {"useSsl": True},
         }
-        response = client.post(
-            "https://www.youtube.com/youtubei/v1/get_panel?prettyPrint=false",
-            json=body,
-            headers={"Content-Type": "application/json", "X-Goog-Visitor-Id": visitor_data},
+
+        candidates = [_build_panel_params(video_id)]
+        panel_match = _PANEL_PARAMS_RE.search(watch.text)
+        if panel_match and panel_match.group(1) not in candidates:
+            candidates.append(panel_match.group(1))
+
+        for params in candidates:
+            response = client.post(
+                "https://www.youtube.com/youtubei/v1/get_panel?prettyPrint=false",
+                json={
+                    "context": context,
+                    "panelId": "PAmodern_transcript_view",
+                    "params": params,
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Goog-Visitor-Id": visitor_data,
+                },
+            )
+            if response.status_code in {403, 429}:
+                raise TranscriptError("YouTube rate limited get_panel", rate_limited=True)
+            if response.status_code >= 400:
+                continue
+            cues = _parse_panel_cues(response.json())
+            if cues:
+                return cues
+
+        raise TranscriptError(
+            "YouTube get_panel returned no transcript cues",
+            reason="no_captions",
         )
-        if response.status_code in {403, 429}:
-            raise TranscriptError("YouTube rate limited get_panel", rate_limited=True)
-        response.raise_for_status()
-        cues = _parse_panel_cues(response.json())
-        if not cues:
-            raise TranscriptError("YouTube get_panel returned no transcript cues")
-        return cues
 
 
 def fetch_transcript_api(
@@ -206,6 +232,12 @@ def fetch_transcript_api(
         )
     if response.status_code == 429:
         raise TranscriptError("TranscriptAPI rate limited the request", rate_limited=True)
+    if response.status_code == 404:
+        # 404 from TranscriptAPI means the video has no captions at all.
+        raise TranscriptError(
+            f"TranscriptAPI returned 404: {response.text[:200]}",
+            reason="no_captions",
+        )
     if response.status_code >= 400:
         raise TranscriptError(
             f"TranscriptAPI returned {response.status_code}: {response.text[:200]}"
@@ -218,7 +250,7 @@ def fetch_transcript_api(
         if isinstance(row, dict) and str(row.get("text") or "").strip()
     ]
     if not cues:
-        raise TranscriptError("TranscriptAPI returned no transcript cues")
+        raise TranscriptError("TranscriptAPI returned no transcript cues", reason="no_captions")
     return cues
 
 
@@ -240,9 +272,17 @@ def fetch_transcript(
             )
         except TranscriptError as fallback_exc:
             rate_limited = bool(getattr(exc, "rate_limited", False)) or fallback_exc.rate_limited
+            primary_reason = getattr(exc, "reason", "error")
+            fallback_reason = fallback_exc.reason
+            combined_reason = (
+                "no_captions"
+                if primary_reason == "no_captions" and fallback_reason == "no_captions"
+                else ("rate_limited" if rate_limited else "error")
+            )
             raise TranscriptError(
                 f"Innertube failed: {exc}; TranscriptAPI failed: {fallback_exc}",
                 rate_limited=rate_limited,
+                reason=combined_reason,
             ) from fallback_exc
 
 
@@ -259,6 +299,16 @@ def build_pdf(
     title: str,
     video_id: str,
 ) -> tuple[bytes, str]:
+    try:
+        from reportlab.lib.pagesizes import LETTER
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+    except ModuleNotFoundError as exc:
+        raise TranscriptError(
+            "reportlab is not installed (pip install reportlab)"
+        ) from exc
+
     buffer = BytesIO()
     styles = getSampleStyleSheet()
     document = SimpleDocTemplate(
@@ -337,6 +387,7 @@ def post_failure(
     video_id: str | None,
     error: str,
     rate_limited: bool,
+    reason: str | None = None,
 ) -> None:
     if not url:
         log.error("Transcript fail_url missing: %s", error)
@@ -352,6 +403,7 @@ def post_failure(
         "video_id": video_id,
         "error": error,
         "rate_limited": rate_limited,
+        "reason": reason or ("rate_limited" if rate_limited else "error"),
     }
     try:
         with httpx.Client(timeout=90.0) as client:

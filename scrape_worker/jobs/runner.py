@@ -223,9 +223,20 @@ def run_job_from_env(env: Optional[dict[str, str]] = None) -> int:
             return 0
         raise ValueError(f"Unknown ARG_JOB_TYPE={job_type!r}")
     except Exception as exc:
-        log.exception("Job failed type=%s job_id=%s", job_type, job_id)
         coordinator_relayed = False
         rate_limited = bool(getattr(exc, "rate_limited", False))
+        reason = getattr(exc, "reason", None)
+        # Expected business outcomes (no captions) are warnings; real errors get full tracebacks.
+        if reason == "no_captions":
+            log.warning(
+                "Transcript unavailable (no captions) type=%s job_id=%s video_id=%s: %s",
+                job_type,
+                job_id,
+                payload.get("video_id"),
+                exc,
+            )
+        else:
+            log.exception("Job failed type=%s job_id=%s", job_type, job_id)
         if job_type == "transcript":
             from jobs.transcript import post_failure
 
@@ -237,6 +248,7 @@ def run_job_from_env(env: Optional[dict[str, str]] = None) -> int:
                 video_id=payload.get("video_id"),
                 error=str(exc),
                 rate_limited=rate_limited,
+                reason=reason,
             )
             coordinator_relayed = True
         _post_callback(
@@ -249,6 +261,7 @@ def run_job_from_env(env: Optional[dict[str, str]] = None) -> int:
                 "job_id": job_id,
                 "error": str(exc),
                 "rate_limited": rate_limited,
+                "reason": reason,
                 "coordinator_relayed": coordinator_relayed,
                 "terminal": True,
             },
