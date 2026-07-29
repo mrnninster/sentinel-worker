@@ -34,8 +34,40 @@
       "value": "1"
     },
     "WORKER_CAPACITY": {
-      "description": "Reported capacity; keep 1 on small dynos",
+      "description": "Reported capacity (alias for HEROKU_ONEOFF_LIMIT)",
+      "value": "50"
+    },
+    "HEROKU_ONEOFF_LIMIT": {
+      "description": "Max concurrent one-off jobs (pool capacity)",
+      "value": "50"
+    },
+    "RESERVE_SCRAPE": {
+      "description": "Slots reserved for schedule scrapes",
       "value": "1"
+    },
+    "RESERVE_TRANSCRIPT": {
+      "description": "Slots reserved for transcripts (accounting only)",
+      "value": "1"
+    },
+    "DISPATCH_MODE": {
+      "description": "auto | local | heroku",
+      "value": "auto"
+    },
+    "HEROKU_API_KEY": {
+      "description": "Platform API token to spawn one-off dynos",
+      "required": true
+    },
+    "HEROKU_APP_NAME": {
+      "description": "App name that hosts one-off dynos (usually this app)",
+      "required": true
+    },
+    "HEROKU_DYNO_SIZE": {
+      "description": "One-off dyno size",
+      "value": "standard-1x"
+    },
+    "INTERNAL_CALLBACK_TOKEN": {
+      "description": "Bearer for job→middleman callbacks (defaults to WORKER_SHARED_TOKEN)",
+      "required": false
     },
     "WORKER_ALLOWED_SOURCES": {
       "value": "*"

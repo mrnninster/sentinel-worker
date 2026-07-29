@@ -66,7 +66,13 @@ PUBLIC_URL="https://${APP}.herokuapp.com"
 echo "==> Setting default config vars (secrets left for you to set)"
 heroku config:set -a "$APP" \
   WORKER_ID="${WORKER_ID:-scrape-worker-1}" \
-  WORKER_CAPACITY="${WORKER_CAPACITY:-1}" \
+  WORKER_CAPACITY="${WORKER_CAPACITY:-50}" \
+  HEROKU_ONEOFF_LIMIT="${HEROKU_ONEOFF_LIMIT:-50}" \
+  RESERVE_SCRAPE="${RESERVE_SCRAPE:-1}" \
+  RESERVE_TRANSCRIPT="${RESERVE_TRANSCRIPT:-1}" \
+  DISPATCH_MODE="${DISPATCH_MODE:-auto}" \
+  HEROKU_APP_NAME="${HEROKU_APP_NAME:-$APP}" \
+  HEROKU_DYNO_SIZE="${HEROKU_DYNO_SIZE:-standard-1x}" \
   WORKER_ALLOWED_SOURCES="${WORKER_ALLOWED_SOURCES:-*}" \
   WORKER_REGISTRATION_OPEN="${WORKER_REGISTRATION_OPEN:-1}" \
   WORKER_HEARTBEAT_SECONDS="${WORKER_HEARTBEAT_SECONDS:-30}" \
@@ -81,8 +87,10 @@ heroku config:set -a "$APP" \
 echo
 echo "==> Required secrets (set before or after first deploy):"
 echo "    heroku config:set -a $APP WORKER_SHARED_TOKEN=… COORDINATOR_URL=https://…"
+echo "    heroku config:set -a $APP HEROKU_API_KEY=…   # Platform API token to spawn one-offs"
 echo "    heroku config:set -a $APP OPENAI_API_KEY=…   # optional, LLM mode only"
 echo
+echo "==> Capacity: HEROKU_ONEOFF_LIMIT=50 (web = middleman; jobs = one-off dynos)"
 echo "==> Dyno size: Playwright needs RAM. Prefer standard-1x or larger (not eco/basic if OOMing)."
 echo "    heroku ps:type standard-1x -a $APP"
 echo

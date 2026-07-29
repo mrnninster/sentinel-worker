@@ -1,7 +1,8 @@
 # Sentinel scrape worker
 
-Standalone FastAPI worker with an embedded schedule scraper (Playwright + dedicated parsers + optional LLM).
-Talks to the Sentinel coordinator (license registry) over HTTP: push commands, heartbeats, and job results.
+Standalone FastAPI **middleman** that accepts coordinator push commands, dispatches each job to a **Heroku one-off dyno** (or a **local thread**), and relays results. Up to **50** concurrent loads per worker (`HEROKU_ONEOFF_LIMIT`).
+
+Embedded schedule scraper (Playwright + dedicated parsers + optional LLM) runs inside each job process/thread — not on the web dyno under load.
 
 ## Local
 
@@ -22,6 +23,8 @@ uvicorn main:app --app-dir scrape_worker --env-file scrape_worker/.env --host 12
 
 OpenAPI: http://127.0.0.1:8100/docs
 
+Local default: `DISPATCH_MODE=auto` with no Heroku API key → each job runs in a **daemon thread** and callbacks to `/v1/internal/jobs/{id}/result`.
+
 ### Env
 
 One `.env` in this directory (see `.env.example`). Important keys:
@@ -31,15 +34,19 @@ One `.env` in this directory (see `.env.example`). Important keys:
 | `WORKER_ID` | Unique per process |
 | `WORKER_SHARED_TOKEN` | Same value as coordinator (`WORKER_TOKEN` alias OK) |
 | `COORDINATOR_URL` | Registry base URL |
-| `WORKER_PUBLIC_URL` | This worker’s public base URL |
+| `WORKER_PUBLIC_URL` | This worker’s public base URL (callback target for jobs) |
 | `WORKER_REGISTRATION_OPEN` | `1` to self-register on boot |
-| `WORKER_CAPACITY` | Reported capacity (keep `1` on small VMs; scrapes are serialized) |
+| `HEROKU_ONEOFF_LIMIT` / `WORKER_CAPACITY` | Max concurrent jobs (**default 50**) |
+| `RESERVE_SCRAPE` / `RESERVE_TRANSCRIPT` | Reserved slots (default `1` each) so monitors cannot fill the pool |
+| `DISPATCH_MODE` | `auto` (Heroku if configured, else local) \| `local` \| `heroku` |
+| `HEROKU_API_KEY` / `HEROKU_APP_NAME` | Required on Heroku to spawn one-offs |
+| `HEROKU_DYNO_SIZE` | One-off size (`standard-1x` default) |
+| `INTERNAL_CALLBACK_TOKEN` | Job→middleman Bearer (defaults to shared token) |
 | `WORKER_HEARTBEAT_SECONDS` | Periodic heartbeat interval (default `30`) |
 | `OPENAI_API_KEY` | Needed for LLM scrape mode |
 | `SCRAPER_MODE` | `embedded` (default) or `http` |
-| `SCRAPER_URL` | Remote scraper base URL when `SCRAPER_MODE=http` |
 
-On **512 MB / 0.5 vCPU**, run **one** Chromium scrape at a time (`WORKER_CAPACITY=1`). Scale by adding more worker processes, not by raising capacity.
+**Capacity:** every worker advertises and enforces up to **50** loads. Stream-status has priority; **1** scrape and **1** transcript slot stay reserved. On Heroku, each running job is a separate one-off dyno (cost scales with concurrency).
 
 ## Coordinator protocol
 
@@ -60,42 +67,38 @@ POST {COORDINATOR_URL}/v1/workers/heartbeat
 Sent:
 
 - every `WORKER_HEARTBEAT_SECONDS` (`reason: "heartbeat"`)
-- immediately when a job finishes (`reason: "idle"` if nothing left, else `"job_finished"`)
+- when a job finishes (`reason: "idle"` if nothing left, else `"job_finished"`)
 
-Example (stream-status monitor running, scrapes free):
+Example:
 
 ```json
 {
   "worker_id": "scrape-worker-1",
   "reason": "heartbeat",
-  "load": 1,
+  "load": 12,
+  "capacity": 50,
+  "oneoff_limit": 50,
+  "oneoff_running": 12,
   "load_by_type": {
-    "scrape": 0,
-    "stream_status": 1
+    "scrape": 1,
+    "stream_status": 11,
+    "transcript": 0
   },
-  "running_job_ids": ["XrHxPmJDazzC5eBj"],
+  "queued_by_type": {
+    "scrape": 0,
+    "stream_status": 2,
+    "transcript": 0
+  },
+  "running_job_ids": ["…"],
   "running_jobs": [
-    { "job_id": "XrHxPmJDazzC5eBj", "load_type": "stream_status" }
+    { "job_id": "…", "load_type": "stream_status" }
   ]
 }
 ```
 
-Fully idle:
+`load_type` values: `"scrape"` | `"stream_status"` | `"transcript"` (transcript reserved only).
 
-```json
-{
-  "worker_id": "scrape-worker-1",
-  "reason": "idle",
-  "load": 0,
-  "load_by_type": { "scrape": 0, "stream_status": 0 },
-  "running_job_ids": [],
-  "running_jobs": []
-}
-```
-
-`load_type` values: `"scrape"` | `"stream_status"`.
-
-Suggested dispatch: treat `load_by_type.scrape === 0` as free for schedule scrapes even if `stream_status > 0` (only if you accept shared Playwright on that host).
+**Command should push while `oneoff_running < capacity`**, not only when `load === 0`. Treat `202` as accepted/queued (may wait for a free slot).
 
 ### Schedule scrape
 
@@ -119,7 +122,7 @@ POST {WORKER_PUBLIC_URL}/v1/commands/scrape
 }
 ```
 
-Scrapes are accepted with `202` and run under a lock (one Playwright scrape at a time).
+Accepted with `202` (`accepted: true`). Work runs on a one-off/thread; middleman relays the result to the coordinator.
 
 **Worker → coordinator**
 
@@ -231,13 +234,14 @@ curl -s http://127.0.0.1:8080/scrape \
 ## Layout
 
 ```text
-main.py              Worker FastAPI (commands / heartbeats / results)
-scraper_bridge.py    embedded | http scrape bridge
-app/                 Schedule scrape FastAPI + LLM pipeline
-schedule/library/    Dedicated platform parsers
-utils/               HTML / Playwright / YouTube helpers
-data/                Meeting categories, etc.
-.env.example         All env vars
+main.py                 Middleman FastAPI (commands / queue / relay)
+dispatch/               Pool, Heroku one-off + local thread spawners
+jobs/runner.py          One-off/thread entrypoint (scrape | stream_status)
+scraper_bridge.py       embedded | http scrape bridge
+app/                    Schedule scrape FastAPI + LLM pipeline
+schedule/library/       Dedicated platform parsers
+utils/                  HTML / Playwright / YouTube helpers
+.env.example            All env vars
 ```
 
 ## Docker / Render (optional)
@@ -251,6 +255,7 @@ docker run --rm -p 8100:10000 \
   -e WORKER_SHARED_TOKEN=dev \
   -e COORDINATOR_URL=http://host.docker.internal:8099 \
   -e WORKER_PUBLIC_URL=http://127.0.0.1:8100 \
+  -e HEROKU_ONEOFF_LIMIT=50 \
   -e PORT=10000 \
   sentinel-scrape-worker
 ```
@@ -261,9 +266,11 @@ Give each replica a unique `WORKER_ID`. Set secrets: `WORKER_SHARED_TOKEN`, `COO
 
 This app uses **classic buildpacks** (Python + Apt for Chromium libs), not the container stack.
 
+The **web** dyno is the middleman only. Jobs run as **one-off** dynos (`python -m jobs.runner`) spawned via the Platform API — set `HEROKU_API_KEY` and `HEROKU_APP_NAME`.
+
 | File | Purpose |
 |------|---------|
-| `Procfile` | `web` process → uvicorn |
+| `Procfile` | `web` process → uvicorn middleman |
 | `runtime.txt` | Python 3.12 |
 | `Aptfile` | OS libs for Playwright Chromium |
 | `bin/post_compile` | `playwright install chromium` on each build |
@@ -278,7 +285,10 @@ cd scrape_worker   # this directory must be the GitHub repo root
 
 heroku config:set -a sentinel-scrape-worker-1 \
   WORKER_SHARED_TOKEN=… \
-  COORDINATOR_URL=https://…
+  COORDINATOR_URL=https://… \
+  HEROKU_API_KEY=… \
+  HEROKU_APP_NAME=sentinel-scrape-worker-1 \
+  HEROKU_ONEOFF_LIMIT=50
 
 # Prefer ≥ standard-1x — Playwright will OOM on tiny dynos
 heroku ps:type standard-1x -a sentinel-scrape-worker-1
@@ -292,4 +302,4 @@ After deploy, confirm:
 curl -sS https://sentinel-scrape-worker-1.herokuapp.com/health
 ```
 
-Ensure `WORKER_PUBLIC_URL` matches that `https://…herokuapp.com` URL (the setup script sets it by default).
+Ensure `WORKER_PUBLIC_URL` matches that `https://…herokuapp.com` URL (the setup script sets it by default). Health should show `"capacity": 50` and `"dispatch_mode": "heroku"`.
