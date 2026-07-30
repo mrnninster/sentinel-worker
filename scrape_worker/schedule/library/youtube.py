@@ -1131,7 +1131,9 @@ class Youtube:
         timezone: str = "America/New_York",
         on_primary_failure: str = "same_day_stub",
         match: str = "title_date",
+        require_title_match: bool = False,
         primary_empty: bool = False,
+        title_match_threshold: float = 0.3,
     ) -> dict:
         """
         Merge YouTube /streams + /videos cards into primary schedule meetings.
@@ -1173,6 +1175,10 @@ class Youtube:
             notes.append(f"streams_url={classified['streams_url']}")
         if classified.get("videos_url"):
             notes.append(f"videos_url={classified['videos_url']}")
+        if require_title_match:
+            notes.append(
+                f"require_title_match=true threshold={title_match_threshold}"
+            )
 
         try:
             tz = pytz.timezone(timezone)
@@ -1189,6 +1195,9 @@ class Youtube:
                 vid = self.extract_video_id(meeting.get(key))
                 if vid:
                     return vid
+            raw_vid = meeting.get("video_id")
+            if isinstance(raw_vid, str) and raw_vid.strip():
+                return raw_vid.strip()
             return None
 
         def meeting_local_date(meeting: dict):
@@ -1203,6 +1212,55 @@ class Youtube:
             except Exception:
                 return None
 
+        def meeting_title(meeting: dict) -> str:
+            return str(
+                meeting.get("Meeting name")
+                or meeting.get("meeting_name")
+                or meeting.get("title")
+                or ""
+            ).strip()
+
+        def title_match(meeting: dict, item: dict) -> tuple[float, str | None]:
+            try:
+                from utils.youtube import title_match_details
+            except ImportError:
+                return 0.0, None
+            return title_match_details(
+                meeting_title(meeting),
+                str(item.get("video_title") or ""),
+                jaccard_threshold=title_match_threshold,
+            )
+
+        def titles_match(meeting: dict, item: dict) -> bool:
+            if not require_title_match:
+                return True
+            _, match_type = title_match(meeting, item)
+            return match_type is not None
+
+        def apply_hit(meeting: dict, hit: dict, *, how: str) -> None:
+            confidence, match_type = (
+                title_match(meeting, hit) if require_title_match else (None, None)
+            )
+            matched_video_ids.add(hit["video_id"])
+            label = self._STATUS_LABELS.get(hit["status"], "Concluded")
+            meeting["Status"] = label
+            meeting["Meeting link"] = hit.get("meeting_link") or meeting.get(
+                "Meeting link"
+            )
+            meeting["video_id"] = hit["video_id"]
+            meeting["Stream type"] = meeting.get("Stream type") or "ts_youtube"
+            if hit.get("scheduled_time") and not meeting.get("Scheduled time"):
+                meeting["Scheduled time"] = hit["scheduled_time"]
+            conf_note = (
+                f" title_match={match_type}:{confidence:.2f}"
+                if confidence is not None
+                else ""
+            )
+            notes.append(
+                f"{how} video_id={hit['video_id']} → Status={label} "
+                f"(tab={hit.get('source_tab', '?')}){conf_note}"
+            )
+
         # Overlay onto existing meetings
         for meeting in result:
             vid = meeting_video_id(meeting)
@@ -1216,32 +1274,43 @@ class Youtube:
                 mdate = meeting_local_date(meeting)
                 if mdate:
                     # Prefer live > upcoming > concluded for same day
+                    best_score = -1.0
                     for bucket in ("live", "upcoming", "concluded"):
                         for item in classified[bucket]:
-                            if self.stream_item_local_date(item, timezone) == mdate:
+                            if item.get("video_id") in matched_video_ids:
+                                continue
+                            if self.stream_item_local_date(item, timezone) != mdate:
+                                continue
+                            if not titles_match(meeting, item):
+                                continue
+                            if require_title_match:
+                                score, _ = title_match(meeting, item)
+                                # Prefer earlier buckets; within a bucket pick best title.
+                                bucket_bonus = {
+                                    "live": 3.0,
+                                    "upcoming": 2.0,
+                                    "concluded": 1.0,
+                                }[bucket]
+                                ranked = bucket_bonus + score
+                                if ranked > best_score:
+                                    best_score = ranked
+                                    hit = item
+                            else:
                                 hit = item
                                 break
-                        if hit:
+                        if hit and not require_title_match:
                             break
 
             if not hit:
                 continue
 
-            matched_video_ids.add(hit["video_id"])
-            label = self._STATUS_LABELS.get(hit["status"], "Concluded")
-            meeting["Status"] = label
-            meeting["Meeting link"] = hit.get("meeting_link") or meeting.get(
-                "Meeting link"
-            )
-            meeting["Stream type"] = meeting.get("Stream type") or "ts_youtube"
-            if hit.get("scheduled_time") and not meeting.get("Scheduled time"):
-                meeting["Scheduled time"] = hit["scheduled_time"]
-            notes.append(
-                f"overlay video_id={hit['video_id']} → Status={label} "
-                f"(tab={hit.get('source_tab', '?')})"
-            )
+            apply_hit(meeting, hit, how="overlay")
 
-        # Same-day stubs for live / upcoming / today's concluded VODs
+        # Same-day stubs for live / upcoming / today's concluded VODs.
+        # When require_title_match and the calendar already returned meetings,
+        # the channel may only attach (title+date) — not invent rows for days
+        # that already have calendar meetings. Stubs still fill empty days, and
+        # when primary_empty the channel remains the meeting source.
         if on_primary_failure == "same_day_stub":
             stub_candidates = []
             stub_candidates.extend(classified["live"])
@@ -1268,22 +1337,50 @@ class Youtube:
                     item_date = today
                 if item_date is not None and item_date in existing_dates:
                     # Already have a primary row for that day — overlay / attach
-                    for meeting in result:
-                        if meeting_local_date(meeting) == item_date:
-                            meeting["Status"] = self._STATUS_LABELS.get(
-                                item["status"], "Concluded"
-                            )
-                            meeting["Meeting link"] = item.get("meeting_link")
-                            meeting["Stream type"] = (
-                                meeting.get("Stream type") or "ts_youtube"
-                            )
-                            existing_vids.add(vid)
+                    same_day = [
+                        m for m in result if meeting_local_date(m) == item_date
+                    ]
+                    if require_title_match:
+                        best_meeting = None
+                        best_score = title_match_threshold
+                        for meeting in same_day:
+                            # Skip meetings that already have a video
+                            if meeting_video_id(meeting):
+                                continue
+                            score, match_type = title_match(meeting, item)
+                            if match_type is not None and score >= best_score:
+                                best_score = score
+                                best_meeting = meeting
+                        if best_meeting is None:
                             notes.append(
-                                f"same-day attach video_id={vid} → "
-                                f"{meeting.get('Meeting name')} "
-                                f"(tab={item.get('source_tab', '?')})"
+                                f"skip same-day attach video_id={vid} "
+                                f"(no title match on {item_date})"
                             )
-                            break
+                            continue
+                        apply_hit(
+                            best_meeting,
+                            item,
+                            how="same-day attach",
+                        )
+                        existing_vids.add(vid)
+                        continue
+
+                    for meeting in same_day:
+                        meeting["Status"] = self._STATUS_LABELS.get(
+                            item["status"], "Concluded"
+                        )
+                        meeting["Meeting link"] = item.get("meeting_link")
+                        meeting["video_id"] = vid
+                        meeting["Stream type"] = (
+                            meeting.get("Stream type") or "ts_youtube"
+                        )
+                        existing_vids.add(vid)
+                        notes.append(
+                            f"same-day attach video_id={vid} → "
+                            f"{meeting.get('Meeting name')} "
+                            f"(tab={item.get('source_tab', '?')})"
+                        )
+                        break
                     continue
 
                 stub = self.stream_item_to_meeting(item, timezone)

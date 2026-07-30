@@ -242,6 +242,9 @@ For `schedule_type=youtube_table` (+ optional `youtube_fallback`):
 - Each of `/streams` and `/videos` is fetched **at most once** per scrape job; paths filter a shared classification.
 - Stream-status polls **clear** that cache each check so status can change to `concluded`.
 - Live cards with **Started streaming on …** (or “Started streaming N days ago”) older than **24 hours** are treated as always-on streams and **skipped** (not tracked as meeting lives). Override with `YOUTUBE_MAX_LIVE_AGE_HOURS`. Monitor jobs exit with `status: "skipped"`.
+- Calendar sources should set `youtube_fallback.require_title_match: true` so a channel VOD is attached only when **title and date** match. Date-only matching is skipped (avoids pinning one video onto every meeting that day). Unmatched meetings are returned without `Meeting link` / `video_id` / `Stream type`.
+
+Full Command ↔ worker contract: [WORKER_HANDOFF.md](./WORKER_HANDOFF.md).
 
 Prefer dedicated parsers (`schedule_type` set) over LLM when possible. LLM mode always uses Playwright.
 

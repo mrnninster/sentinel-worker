@@ -267,6 +267,7 @@ class ScheduleScrapeService:
                 timezone=timezone,
                 on_primary_failure=fallback.on_primary_failure,
                 match=fallback.match,
+                require_title_match=fallback.require_title_match,
                 primary_empty=primary_empty,
             )
 

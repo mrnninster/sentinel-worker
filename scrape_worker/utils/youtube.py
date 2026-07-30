@@ -7,6 +7,7 @@ from datetime import datetime
 from pytubefix import YouTube as YT
 from googleapiclient.discovery import build
 import requests
+from fuzzywuzzy import fuzz
 from dotenv import load_dotenv
 
 from logging_config import get_dedicated_debug_logger, LOG_LEVEL
@@ -132,6 +133,72 @@ def fuzzy_match_confidence(calendar_name: str, youtube_title: str) -> float:
     return overlap / union if union > 0 else 0.0
 
 
+def title_match_details(
+    calendar_name: str,
+    youtube_title: str,
+    *,
+    jaccard_threshold: float = 0.3,
+    keyword_threshold: float = 0.6,
+    fuzzy_threshold: float = 0.7,
+) -> tuple[float, str | None]:
+    """Match titles using exact, containment, keyword, Jaccard, and fuzzy signals.
+
+    Every strategy is evaluated. The strongest accepted strategy is returned as
+    ``(confidence, match_type)``. Requiring two shared keywords for non-exact
+    matches prevents generic one-word overlaps such as "Council" from attaching
+    the wrong video.
+    """
+    calendar = normalize_for_matching(calendar_name)
+    youtube = normalize_for_matching(youtube_title)
+    if not calendar or not youtube:
+        return 0.0, None
+
+    calendar_tokens = set(calendar.split())
+    youtube_tokens = set(youtube.split())
+    common = calendar_tokens & youtube_tokens
+
+    if calendar == youtube:
+        return 1.0, "exact"
+
+    shorter, longer = sorted((calendar, youtube), key=len)
+    if (
+        shorter in longer
+        and (len(shorter.split()) >= 2 or calendar_tokens == youtube_tokens)
+    ):
+        return 0.98, "containment"
+
+    fuzzy = fuzz.token_set_ratio(calendar, youtube) / 100.0
+
+    # A high fuzzy score can recover misspellings even when tokens differ.
+    typo_threshold = 0.82 if not common else 0.92
+    if (
+        len(common) < 2
+        and len(calendar_tokens) >= 2
+        and len(youtube_tokens) >= 2
+        and fuzzy >= max(fuzzy_threshold, typo_threshold)
+    ):
+        return fuzzy, "fuzzy"
+
+    # Other non-exact strategies need at least two meaningful shared tokens.
+    if len(common) < 2:
+        return 0.0, None
+
+    candidates: list[tuple[float, str]] = []
+    union = calendar_tokens | youtube_tokens
+    jaccard = len(common) / len(union) if union else 0.0
+    if jaccard >= jaccard_threshold:
+        candidates.append((jaccard, "token_jaccard"))
+
+    keyword_coverage = len(common) / min(len(calendar_tokens), len(youtube_tokens))
+    if keyword_coverage >= keyword_threshold:
+        candidates.append((keyword_coverage, "keyword_intersection"))
+
+    if fuzzy >= fuzzy_threshold:
+        candidates.append((fuzzy, "fuzzy"))
+
+    return max(candidates, default=(0.0, None), key=lambda candidate: candidate[0])
+
+
 def find_best_match(
     meeting_title: str, live_videos: list, threshold: float = 0.3
 ) -> tuple:
@@ -161,16 +228,15 @@ def find_best_match(
     for video_data in live_videos:
         video_title = video_data.get("video_title", "")
 
-        # Check for exact substring match first (highest priority)
-        if meeting_title.lower() in video_title.lower():
-            return video_data, 1.0, "exact"
-
-        # Calculate fuzzy confidence
-        confidence = fuzzy_match_confidence(meeting_title, video_title)
+        confidence, candidate_type = title_match_details(
+            meeting_title,
+            video_title,
+            jaccard_threshold=threshold,
+        )
         if confidence > best_confidence:
             best_confidence = confidence
             best_match = video_data
-            match_type = "fuzzy" if confidence >= threshold else None
+            match_type = candidate_type
 
     if best_confidence >= threshold:
         return best_match, best_confidence, match_type

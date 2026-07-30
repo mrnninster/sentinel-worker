@@ -34,6 +34,16 @@ class YoutubeFallbackConfig(BaseModel):
             "video_id = match only via Meeting link / known video id."
         ),
     )
+    require_title_match: bool = Field(
+        default=False,
+        description=(
+            "When true (calendar sources), attach a channel video only when the "
+            "video title matches the meeting title as well as the date. Date-only "
+            "matches are skipped so one VOD is not pinned onto every meeting that day. "
+            "Unmatched meetings are returned without Meeting link / video_id / "
+            "Stream type. same_day_stub still applies when the calendar scrape fails."
+        ),
+    )
 
 
 class ScrapeScheduleRequest(BaseModel):
