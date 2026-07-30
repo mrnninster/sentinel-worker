@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dispatch.heroku_oneoff import create_oneoff_dyno, heroku_configured, kill_oneoff_dyno
+from dispatch.lifecycle import is_shutting_down
 from dispatch.local_thread import start_local_thread
 from dispatch.pool import QueuedJob, pool
 
@@ -123,6 +125,10 @@ async def spawn_job(job: QueuedJob) -> Any:
 
 async def drain_pool() -> int:
     """Start as many queued jobs as capacity allows. Returns number started."""
+    # A late job callback can arrive while lifespan shutdown is killing dynos.
+    # Never let its release-and-drain path start replacement work.
+    if is_shutting_down():
+        return 0
     started = 0
     while True:
         job = pool.pop_next_runnable()
@@ -177,3 +183,45 @@ async def release_and_drain(job_id: str, *, kill_dyno: bool = False) -> None:
         if isinstance(handle, dict) and handle.get("id"):
             await kill_oneoff_dyno(str(handle["id"]))
     await drain_pool()
+
+
+async def shutdown_dispatch() -> dict[str, int]:
+    """Stop tracked work without draining queues or starting replacements."""
+    running = list(pool.running.values())
+    dyno_ids = [
+        str(job.handle["id"])
+        for job in running
+        if isinstance(job.handle, dict) and job.handle.get("id")
+    ]
+
+    killed = 0
+    failed = 0
+    if use_heroku() and dyno_ids:
+        log.info("Shutdown: stopping %s Heroku one-off dyno(s)", len(dyno_ids))
+        results = await asyncio.gather(
+            *(kill_oneoff_dyno(dyno_id) for dyno_id in dyno_ids),
+            return_exceptions=True,
+        )
+        killed = sum(result is True for result in results)
+        failed = len(results) - killed
+        if failed:
+            log.error(
+                "Shutdown: failed to stop %s/%s Heroku one-off dyno(s); "
+                "they may run until their commands exit",
+                failed,
+                len(dyno_ids),
+            )
+
+    # Clear in-memory state for local --reload and prevent stale capacity.
+    for job in running:
+        pool.release(job.job_id)
+    for queue in pool.queues.values():
+        queue.clear()
+    pool.queued_ids.clear()
+
+    return {
+        "running": len(running),
+        "dynos_found": len(dyno_ids),
+        "dynos_killed": killed,
+        "dynos_failed": failed,
+    }

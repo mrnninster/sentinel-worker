@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import secrets
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator
@@ -25,7 +26,13 @@ from dispatch.pool import (
     QueuedJob,
     pool,
 )
-from dispatch.spawner import enqueue_and_drain, release_and_drain, use_heroku
+from dispatch.lifecycle import clear_shutdown, request_shutdown, terminate_children
+from dispatch.spawner import (
+    enqueue_and_drain,
+    release_and_drain,
+    shutdown_dispatch,
+    use_heroku,
+)
 from scraper_bridge import scraper_mode
 
 __version__ = "2.0.0"
@@ -38,6 +45,9 @@ log = logging.getLogger("scrape_worker")
 
 _allowed_sources: list[str] = ["*"]
 _heartbeat_task: asyncio.Task | None = None
+# Results Command could not receive yet, retried on the heartbeat tick.
+_pending_relays: deque[tuple[str, dict[str, Any]]] = deque()
+_coordinator_online = True
 
 
 def _worker_id() -> str:
@@ -67,6 +77,13 @@ def _internal_token() -> str:
         or os.environ.get("WORKER_TOKEN")
         or "dev-internal"
     ).strip()
+
+
+def _shutdown_grace() -> float:
+    try:
+        return max(0.0, float(os.environ.get("SHUTDOWN_GRACE_SECONDS") or "5"))
+    except ValueError:
+        return 5.0
 
 
 def _worker_capacity() -> int:
@@ -169,36 +186,96 @@ def _load_snapshot() -> dict[str, Any]:
     return snap
 
 
-async def _post_coordinator(path: str, body: dict[str, Any]) -> None:
+def _relay_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get("COORDINATOR_RETRY_ATTEMPTS") or "3"))
+    except ValueError:
+        return 3
+
+
+def _pending_relay_max() -> int:
+    try:
+        return max(0, int(os.environ.get("COORDINATOR_PENDING_MAX") or "500"))
+    except ValueError:
+        return 500
+
+
+async def _post_coordinator(
+    path: str,
+    body: dict[str, Any],
+    *,
+    attempts: int = 1,
+) -> bool:
+    """POST to Command. Returns True on 2xx/3xx. Never raises.
+
+    Retries connection errors and 5xx with backoff. A 4xx is not retried: the
+    coordinator understood us and repeating the call cannot change the outcome.
+    """
     base = _coordinator_url()
     if not base:
         log.warning("COORDINATOR_URL unset; skip callback %s", path)
-        return
-    token = _worker_token()
+        return False
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {_worker_token()}",
         "X-Worker-Id": _worker_id(),
         "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(f"{base}{path}", json=body, headers=headers)
-        if resp.status_code >= 400:
-            log.error("Coordinator %s → %s %s", path, resp.status_code, resp.text[:400])
+    delay = 5.0
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(f"{base}{path}", json=body, headers=headers)
+            if resp.status_code < 400:
+                return True
+            if resp.status_code < 500:
+                log.error(
+                    "Coordinator %s → %s %s (not retrying)",
+                    path,
+                    resp.status_code,
+                    resp.text[:400],
+                )
+                return False
+            log.warning(
+                "Coordinator %s → %s (attempt %s/%s)",
+                path,
+                resp.status_code,
+                attempt,
+                attempts,
+            )
+        except Exception as exc:
+            log.warning(
+                "Coordinator %s unreachable (attempt %s/%s): %s",
+                path,
+                attempt,
+                attempts,
+                exc,
+            )
+        if attempt < attempts:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60.0)
+    return False
 
 
 async def _notify_load(*, reason: str = "heartbeat") -> None:
+    global _coordinator_online
     snap = _load_snapshot()
     if reason == "idle" and snap["load"] > 0:
         reason = "job_finished"
-    try:
-        await _post_coordinator(
-            "/v1/workers/heartbeat",
-            {
-                "worker_id": _worker_id(),
-                "reason": reason,
-                **snap,
-            },
-        )
+    ok = await _post_coordinator(
+        "/v1/workers/heartbeat",
+        {
+            "worker_id": _worker_id(),
+            "reason": reason,
+            **snap,
+        },
+    )
+    if ok:
+        # Command may have forgotten us while it was down (restart / empty state).
+        if not _coordinator_online:
+            log.info("Coordinator reachable again; re-registering and flushing relays")
+            _coordinator_online = True
+            await _register_with_coordinator()
+            await _flush_pending_relays()
         log.info(
             "Load notify reason=%s load=%s by_type=%s queued=%s",
             reason,
@@ -206,14 +283,17 @@ async def _notify_load(*, reason: str = "heartbeat") -> None:
             snap["load_by_type"],
             snap["queued_by_type"],
         )
-    except Exception:
-        log.exception("Load notify failed reason=%s", reason)
+    else:
+        if _coordinator_online:
+            log.error("Coordinator unreachable; worker keeps queueing and running jobs")
+        _coordinator_online = False
 
 
 async def _heartbeat_loop() -> None:
     interval = int(os.environ.get("WORKER_HEARTBEAT_SECONDS") or "30")
     while True:
         await _notify_load(reason="heartbeat")
+        await _flush_pending_relays()
         await asyncio.sleep(interval)
 
 
@@ -246,11 +326,13 @@ async def _register_with_coordinator() -> None:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(f"{base}/v1/workers/register", json=body)
             log.info("Self-register → %s %s", resp.status_code, resp.text[:200])
-    except Exception:
-        log.exception("Self-register failed")
+    except Exception as exc:
+        # Not fatal: heartbeats keep retrying and re-register once Command answers.
+        log.warning("Self-register failed (will retry on heartbeat): %s", exc)
 
 
-async def _relay_to_coordinator(job_id: str, body: dict[str, Any], *, fail: bool) -> None:
+async def _relay_to_coordinator(job_id: str, body: dict[str, Any], *, fail: bool) -> bool:
+    """Forward a job result/failure. Buffers for retry if Command is unreachable."""
     path = (
         f"/v1/workers/jobs/{job_id}/fail"
         if fail
@@ -260,7 +342,29 @@ async def _relay_to_coordinator(job_id: str, body: dict[str, Any], *, fail: bool
     forward = {k: v for k, v in body.items() if k != "terminal"}
     if "worker_id" not in forward:
         forward["worker_id"] = _worker_id()
-    await _post_coordinator(path, forward)
+    if await _post_coordinator(path, forward, attempts=_relay_attempts()):
+        return True
+
+    limit = _pending_relay_max()
+    if limit:
+        if len(_pending_relays) >= limit:
+            dropped_path, _ = _pending_relays.popleft()
+            log.error("Pending relay buffer full; dropped oldest %s", dropped_path)
+        _pending_relays.append((path, forward))
+        log.warning(
+            "Buffered relay for retry path=%s pending=%s", path, len(_pending_relays)
+        )
+    return False
+
+
+async def _flush_pending_relays() -> None:
+    """Drain buffered results once Command answers again."""
+    while _pending_relays:
+        path, body = _pending_relays[0]
+        if not await _post_coordinator(path, body):
+            return
+        _pending_relays.popleft()
+        log.info("Flushed buffered relay path=%s pending=%s", path, len(_pending_relays))
 
 
 @asynccontextmanager
@@ -274,6 +378,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Keep pool limit aligned with capacity (default 50).
     pool.max_oneoff = _worker_capacity()
+    # A --reload restart reuses the interpreter; clear any stale shutdown flag.
+    clear_shutdown()
 
     await _register_with_coordinator()
     _heartbeat_task = asyncio.create_task(_heartbeat_loop(), name="worker-heartbeat")
@@ -288,8 +394,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Tell monitor loops to stop at their next poll boundary, then kill the
+        # Playwright driver/Chromium children that daemon threads leave behind.
+        request_shutdown()
         if _heartbeat_task:
             _heartbeat_task.cancel()
+        dispatch_summary = await shutdown_dispatch()
+        if dispatch_summary["running"]:
+            log.info("Shutdown dispatch summary: %s", dispatch_summary)
+        if _pending_relays:
+            log.warning(
+                "Shutting down with %s unrelayed result(s); Command will re-dispatch "
+                "after lease expiry",
+                len(_pending_relays),
+            )
+        await asyncio.to_thread(terminate_children, grace=_shutdown_grace())
 
 
 app = FastAPI(
@@ -419,15 +538,19 @@ async def internal_job_result(
     else:
         terminal = bool(body.get("terminal"))
 
-    # Transcript jobs upload the PDF/failure directly to their dedicated Command
-    # endpoints; this internal callback exists only to release the pool slot.
-    if not body.get("coordinator_relayed"):
-        await _relay_to_coordinator(job_id, body, fail=False)
-
-    if terminal:
-        await release_and_drain(job_id, kill_dyno=False)
-        await _notify_load(reason="idle")
-    return {"ok": True, "job_id": job_id, "terminal": terminal}
+    relayed = True
+    try:
+        # Transcript jobs upload the PDF/failure directly to their dedicated Command
+        # endpoints; this internal callback exists only to release the pool slot.
+        if not body.get("coordinator_relayed"):
+            relayed = await _relay_to_coordinator(job_id, body, fail=False)
+    finally:
+        # Always free the slot: a job that finished has stopped consuming capacity
+        # whether or not Command could be told about it.
+        if terminal:
+            await release_and_drain(job_id, kill_dyno=False)
+            await _notify_load(reason="idle")
+    return {"ok": True, "job_id": job_id, "terminal": terminal, "relayed": relayed}
 
 
 @app.post("/v1/internal/jobs/{job_id}/fail")
@@ -436,8 +559,11 @@ async def internal_job_fail(
     body: dict[str, Any],
     _: None = Depends(require_internal_auth),
 ) -> dict:
-    if not body.get("coordinator_relayed"):
-        await _relay_to_coordinator(job_id, body, fail=True)
-    await release_and_drain(job_id, kill_dyno=False)
-    await _notify_load(reason="idle")
-    return {"ok": True, "job_id": job_id, "failed": True}
+    relayed = True
+    try:
+        if not body.get("coordinator_relayed"):
+            relayed = await _relay_to_coordinator(job_id, body, fail=True)
+    finally:
+        await release_and_drain(job_id, kill_dyno=False)
+        await _notify_load(reason="idle")
+    return {"ok": True, "job_id": job_id, "failed": True, "relayed": relayed}

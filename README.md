@@ -44,10 +44,32 @@ One `.env` in this directory (see `.env.example`). Important keys:
 | `INTERNAL_CALLBACK_TOKEN` | Job→middleman Bearer (defaults to shared token) |
 | `TRANSCRIPTAPI_API_KEY` | TranscriptAPI fallback when YouTube Innertube is blocked |
 | `WORKER_HEARTBEAT_SECONDS` | Periodic heartbeat interval (default `30`) |
+| `COORDINATOR_RETRY_ATTEMPTS` | Result relay attempts (default `3`); exponential backoff starts at 5s and doubles |
+| `COORDINATOR_PENDING_MAX` | Results buffered while Command is down (default `500`, `0` disables) |
+| `SHUTDOWN_GRACE_SECONDS` | Wait for browser children on shutdown before SIGKILL (default `5`) |
 | `OPENAI_API_KEY` | Needed for LLM scrape mode |
 | `SCRAPER_MODE` | `embedded` (default) or `http` |
 
 **Capacity:** every worker advertises and enforces up to **50** loads. Stream-status has priority; **1** scrape and **1** transcript slot stay reserved. On Heroku, each running job is a separate one-off dyno (cost scales with concurrency).
+
+### When Command is unreachable
+
+The worker keeps accepting and running work; only reporting is affected.
+
+- Result/failure relays retry with backoff, then buffer in memory and re-send on the next successful heartbeat.
+- **The pool slot is always released** when a job finishes, even if Command cannot be told. Otherwise an outage would permanently consume capacity.
+- A failed boot registration is not fatal: the worker re-registers automatically once a heartbeat succeeds (also covers a Command restart that forgot the worker).
+- Buffers are in memory only. A worker restart during an outage loses unsent results, and Command re-dispatches after its lease expires.
+
+### Shutdown
+
+On SIGTERM/SIGINT (deploy, restart, `--reload`):
+
+1. Monitor loops stop at the next poll instead of sleeping up to `max_duration_seconds`, and post a retryable failure so Command re-dispatches promptly.
+2. In Heroku mode, all tracked one-off dynos are stopped concurrently through the Platform API. No queued replacement jobs are started during shutdown.
+3. In local mode, surviving child processes (the Playwright node driver and Chromium, started by job threads) get SIGTERM, then SIGKILL after `SHUTDOWN_GRACE_SECONDS`.
+
+Without local child reaping these browsers outlive the worker, because local jobs run in daemon threads that are killed without unwinding, so `browser.close()` never runs. In-flight jobs stopped during shutdown are re-dispatched by Command after their lease expires. A `SIGKILL` of the worker itself bypasses lifespan cleanup — local children can be orphaned and Heroku one-offs continue until their commands exit.
 
 ## Coordinator protocol
 
@@ -272,6 +294,7 @@ curl -s http://127.0.0.1:8080/scrape \
 ```text
 main.py                 Middleman FastAPI (commands / queue / relay)
 dispatch/               Pool, Heroku one-off + local thread spawners
+dispatch/lifecycle.py   Cooperative shutdown + child-process reaping
 jobs/runner.py          One-off/thread entrypoint (scrape | stream_status | transcript)
 jobs/transcript.py      Innertube/TranscriptAPI retrieval + PDF upload
 scraper_bridge.py       embedded | http scrape bridge

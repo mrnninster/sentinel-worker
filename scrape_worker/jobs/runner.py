@@ -12,6 +12,8 @@ from typing import Any, Optional
 
 import httpx
 
+from dispatch.lifecycle import is_shutting_down, sleep_unless_shutdown
+
 log = logging.getLogger("jobs.runner")
 
 
@@ -34,20 +36,41 @@ def _post_callback(url: str, token: str, body: dict[str, Any], *, fail: bool = F
     target = url
     if fail and url.rstrip("/").endswith("/result"):
         target = url.rstrip("/")[: -len("/result")] + "/fail"
-    try:
-        with httpx.Client(timeout=120.0) as client:
-            resp = client.post(target, json=body, headers=headers)
-            if resp.status_code >= 400:
-                log.error(
-                    "Callback %s → %s %s",
-                    target,
-                    resp.status_code,
-                    resp.text[:400],
-                )
-            else:
+
+    # Retry: dropping this callback would also strand the job's pool slot until
+    # the middleman restarts, so a transient blip must not be fatal.
+    attempts = 3
+    delay = 5.0
+    for attempt in range(1, attempts + 1):
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(target, json=body, headers=headers)
+            if resp.status_code < 400:
                 log.info("Callback ok %s status=%s", target, resp.status_code)
-    except Exception:
-        log.exception("Callback failed url=%s", target)
+                return
+            log.error(
+                "Callback %s → %s %s (attempt %s/%s)",
+                target,
+                resp.status_code,
+                resp.text[:400],
+                attempt,
+                attempts,
+            )
+            if resp.status_code < 500:
+                return
+        except Exception as exc:
+            log.warning(
+                "Callback failed url=%s (attempt %s/%s): %s",
+                target,
+                attempt,
+                attempts,
+                exc,
+            )
+        if attempt < attempts and sleep_unless_shutdown(delay):
+            delay *= 2
+        else:
+            break
+    log.error("Callback giving up url=%s", target)
 
 
 def _run_scrape(payload: dict[str, Any], worker_id: str) -> dict[str, Any]:
@@ -89,6 +112,28 @@ def _run_stream_status(
 
     started = time.time()
     while True:
+        if is_shutting_down():
+            # Report a retryable failure so Command re-dispatches immediately
+            # instead of waiting for the monitor lease to expire.
+            log.info("stream-status stopping for shutdown job_id=%s", job_id)
+            _post_callback(
+                callback_url,
+                callback_token,
+                {
+                    "worker_id": worker_id,
+                    "ok": False,
+                    "load_type": "stream_status",
+                    "job_id": job_id,
+                    "meeting_id": meeting_id,
+                    "error": "worker shutting down",
+                    "reason": "worker_shutdown",
+                    "retryable": True,
+                    "terminal": True,
+                },
+                fail=True,
+            )
+            return
+
         elapsed = time.time() - started
         if elapsed > max_duration:
             body = {
@@ -164,7 +209,7 @@ def _run_stream_status(
         _post_callback(callback_url, callback_token, body)
         if terminal:
             return
-        time.sleep(poll_interval)
+        sleep_unless_shutdown(poll_interval)
 
 
 def run_job_from_env(env: Optional[dict[str, str]] = None) -> int:
