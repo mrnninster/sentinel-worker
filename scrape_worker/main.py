@@ -552,7 +552,7 @@ async def admin_logs_stream(
     since: Annotated[str | None, Query()] = None,
     q: Annotated[str | None, Query()] = None,
     level: Annotated[str | None, Query()] = None,
-    limit: Annotated[int, Query(ge=1, le=10000)] = 5000,
+    limit: Annotated[int, Query(ge=1, le=10000)] = 500,
 ) -> StreamingResponse:
     """Realtime log stream (SSE). One long-lived connection; no polling."""
     import json

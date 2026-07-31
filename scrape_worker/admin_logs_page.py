@@ -151,7 +151,7 @@ def logs_viewer_html(*, token: str, worker_id: str) -> str:
 <body>
   <header>
     <h1>Logs · {wid}</h1>
-    <span class="meta" id="meta" title="Live view shows matching lines from the in-memory buffer (kept up to 6 hours). Download pulls daily files for the last 7 calendar days.">
+    <span class="meta" id="meta" title="Live view keeps a sliding window of the newest 500 matching lines in the browser. Download pulls daily files for the last 7 calendar days.">
       Connecting…
     </span>
     <label>Lookback
@@ -183,11 +183,13 @@ def logs_viewer_html(*, token: str, worker_id: str) -> str:
   <main id="log"></main>
   <div class="note">
     Logs are written to disk and survive reloads. The live view tails that file over one SSE
-    connection (no in-memory buffer). <strong>Download 7d</strong> exports today + 6 prior days.
+    connection and keeps only the newest <strong>500</strong> matching lines in the browser
+    (older rows drop off as new ones arrive). <strong>Download 7d</strong> exports today + 6 prior days.
     Heroku disks are ephemeral across dyno restarts; one-off dyno logs need <code>heroku logs</code>.
   </div>
   <script>
     const TOKEN = {json.dumps(token)};
+    const MAX_VISIBLE_LINES = 500;
     const root = document.getElementById("log");
     const statusEl = document.getElementById("status");
     const metaEl = document.getElementById("meta");
@@ -235,6 +237,28 @@ def logs_viewer_html(*, token: str, worker_id: str) -> str:
       }}
     }}
 
+    function trimToMax() {{
+      const rows = root.querySelectorAll(".row");
+      const overflow = rows.length - MAX_VISIBLE_LINES;
+      if (overflow <= 0) {{
+        shownCount = rows.length;
+        return;
+      }}
+      let removedHeight = 0;
+      const removeUntil = Math.min(overflow, rows.length);
+      for (let i = 0; i < removeUntil; i++) {{
+        const row = rows[i];
+        removedHeight += row.offsetHeight;
+        const key = row.dataset.key;
+        if (key) seen.delete(key);
+        row.remove();
+      }}
+      shownCount = root.querySelectorAll(".row").length;
+      if (!stickBottom && removedHeight) {{
+        root.scrollTop = Math.max(0, root.scrollTop - removedHeight);
+      }}
+    }}
+
     function appendEntries(entries) {{
       if (!entries || !entries.length) return;
       const empty = root.querySelector(".empty");
@@ -245,10 +269,10 @@ def logs_viewer_html(*, token: str, worker_id: str) -> str:
         if (seen.has(key)) continue;
         seen.add(key);
         frag.appendChild(buildRow(e));
-        shownCount += 1;
       }}
       if (frag.childNodes.length) {{
         root.appendChild(frag);
+        trimToMax();
         if (stickBottom) root.scrollTop = root.scrollHeight;
       }}
     }}
@@ -261,8 +285,8 @@ def logs_viewer_html(*, token: str, worker_id: str) -> str:
         ? ""
         : (" · log file " + (bytes < 1024 ? bytes + " B" : (bytes/1024).toFixed(1) + " KB"));
       metaEl.textContent =
-        shownCount + " lines on screen · read from disk (kept " + days + " days)" +
-        sizeLabel + " · live lookback up to " + hours + "h";
+        shownCount + " / " + MAX_VISIBLE_LINES + " lines on screen (sliding window)" +
+        sizeLabel + " · disk kept " + days + " days · lookback up to " + hours + "h";
     }}
 
     function setStatus(text, live) {{
@@ -285,7 +309,7 @@ def logs_viewer_html(*, token: str, worker_id: str) -> str:
       const params = new URLSearchParams();
       params.set("token", TOKEN);
       params.set("since", since);
-      params.set("limit", "5000");
+      params.set("limit", String(MAX_VISIBLE_LINES));
       const level = document.getElementById("level").value;
       const q = document.getElementById("q").value.trim();
       if (level) params.set("level", level);
