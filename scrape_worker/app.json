@@ -80,7 +80,7 @@
       "value": "embedded"
     },
     "SCRAPER_ROOT": {
-      "value": "/app"
+      "value": "/app/scrape_worker"
     },
     "PLAYWRIGHT_BROWSERS_PATH": {
       "description": "Must match bin/post_compile install path",

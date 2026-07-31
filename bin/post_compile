@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Runs after pip install (Heroku Python buildpack).
+set -euo pipefail
+
+log() { echo "-----> $*" ; }
+
+log "Installing Playwright Chromium"
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/app/.playwright}"
+mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
+python -m playwright install chromium
+
+log "Playwright Chromium ready at ${PLAYWRIGHT_BROWSERS_PATH}"

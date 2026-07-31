@@ -348,21 +348,20 @@ Give each replica a unique `WORKER_ID`. Set secrets: `WORKER_SHARED_TOKEN`, `COO
 
 This app uses **classic buildpacks** (Python + Apt for Chromium libs), not the container stack.
 
-The **web** dyno is the middleman only. Jobs run as **one-off** dynos (`python -m jobs.runner`) spawned via the Platform API — set `HEROKU_API_KEY` and `HEROKU_APP_NAME`.
+Deploy from the **monorepo root** (`sentinel-worker`): root `Procfile` / `requirements.txt` / `Aptfile` / `runtime.txt` / `bin/post_compile` point at `scrape_worker/`. The **web** dyno is the middleman only. Jobs run as **one-off** dynos (`cd scrape_worker && python -m jobs.runner`) via the Platform API — set `HEROKU_API_KEY` and `HEROKU_APP_NAME`.
 
 | File | Purpose |
 |------|---------|
-| `Procfile` | `web` process → uvicorn middleman |
-| `runtime.txt` | Python 3.12 |
-| `Aptfile` | OS libs for Playwright Chromium |
-| `bin/post_compile` | `playwright install chromium` on each build |
-| `app.json` | App metadata / suggested config for GitHub |
-| `scripts/setup-heroku.sh` | Create app, set stack + buildpacks + defaults |
+| `Procfile` (repo root) | `web` → uvicorn with `--app-dir scrape_worker` |
+| `requirements.txt` (repo root) | Includes `scrape_worker/requirements.txt` |
+| `runtime.txt` / `Aptfile` / `bin/post_compile` | Python version, Chromium OS libs, Playwright install |
+| `scrape_worker/app.json` | App metadata / suggested config |
+| `scrape_worker/scripts/setup-heroku.sh` | Create app, set stack + buildpacks + defaults |
 
 **One-time setup**
 
 ```bash
-cd scrape_worker   # this directory must be the GitHub repo root
+cd scrape_worker
 ./scripts/setup-heroku.sh sentinel-scrape-worker-1
 
 heroku config:set -a sentinel-scrape-worker-1 \
@@ -375,6 +374,8 @@ heroku config:set -a sentinel-scrape-worker-1 \
 # Prefer ≥ standard-1x — Playwright will OOM on tiny dynos
 heroku ps:type standard-1x -a sentinel-scrape-worker-1
 ```
+
+Confirm `SCRAPER_ROOT=/app/scrape_worker` (the setup script sets this for the monorepo layout).
 
 Then in the Heroku dashboard: **Deploy → Connect to GitHub** → enable auto-deploy → **Deploy Branch**.
 

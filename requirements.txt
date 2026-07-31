@@ -1,0 +1,2 @@
+# Install deps from the scrape worker package (Heroku build root = repo root).
+-r scrape_worker/requirements.txt

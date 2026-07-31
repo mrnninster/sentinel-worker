@@ -36,7 +36,7 @@ if ! command -v heroku >/dev/null 2>&1; then
 fi
 
 echo "==> App: $APP"
-echo "==> Root: $ROOT (must be the GitHub repo root for Deploy from GitHub)"
+echo "==> Root: $ROOT (GitHub repo may be monorepo parent; deploy files live at repo root)"
 
 if heroku apps:info -a "$APP" >/dev/null 2>&1; then
   echo "==> App already exists"
@@ -78,7 +78,7 @@ heroku config:set -a "$APP" \
   WORKER_HEARTBEAT_SECONDS="${WORKER_HEARTBEAT_SECONDS:-30}" \
   WORKER_PUBLIC_URL="${WORKER_PUBLIC_URL:-$PUBLIC_URL}" \
   SCRAPER_MODE=embedded \
-  SCRAPER_ROOT=/app \
+  SCRAPER_ROOT=/app/scrape_worker \
   PLAYWRIGHT_BROWSERS_PATH=/app/.playwright \
   YOUTUBE_MAX_LIVE_AGE_HOURS="${YOUTUBE_MAX_LIVE_AGE_HOURS:-24}" \
   LOG_LEVEL="${LOG_LEVEL:-info}" \
@@ -96,7 +96,7 @@ echo "    heroku ps:type standard-1x -a $APP"
 echo
 echo "==> Next: Deploy from GitHub"
 echo "    1. Open https://dashboard.heroku.com/apps/${APP}/deploy/github"
-echo "    2. Connect this repo (root = scrape_worker with Procfile / requirements.txt)"
+echo "    2. Connect this repo (repo root has Procfile / requirements.txt; app code in scrape_worker/)"
 echo "    3. Enable automatic deploys and click Deploy Branch"
 echo
 echo "Done. Health check after deploy: curl -sS ${PUBLIC_URL}/health"

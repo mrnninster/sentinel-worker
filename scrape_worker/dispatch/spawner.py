@@ -110,7 +110,10 @@ async def spawn_job(job: QueuedJob) -> Any:
     """Start execution; returns handle (thread or dyno dict). Raises on hard failure."""
     env = build_job_env(job)
     if use_heroku():
-        dyno = await create_oneoff_dyno(command="python -m jobs.runner", env=env)
+        dyno = await create_oneoff_dyno(
+            command="cd scrape_worker && python -m jobs.runner",
+            env=env,
+        )
         if not dyno:
             raise RuntimeError("Failed to start Heroku one-off dyno (capacity or API)")
         return dyno
