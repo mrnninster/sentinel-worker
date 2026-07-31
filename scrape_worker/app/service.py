@@ -268,6 +268,7 @@ class ScheduleScrapeService:
                 on_primary_failure=fallback.on_primary_failure,
                 match=fallback.match,
                 require_title_match=fallback.require_title_match,
+                max_meeting_age_hours=fallback.max_meeting_age_hours,
                 primary_empty=primary_empty,
             )
 

@@ -185,6 +185,34 @@ at least two shared meaningful words; high-confidence fuzzy matching also
 recovers misspellings. This prevents generic overlaps such as `City Council`
 versus `County Council`.
 
+Date matching is also bounded by `max_meeting_age_hours` (default `24`): a
+channel video is only date-matched onto meetings newer than that, so a
+back-dated VOD cannot be pinned onto a meeting that finished days ago. An exact
+`video_id` match still refreshes status at any age. Send `0` to allow backfill
+onto older meetings.
+
+Keep title and date separate. The title is used only by the title matcher. The
+video date must come from YouTube's structured `ytInitialData` card metadata:
+modern `metadataParts` or legacy `publishedTimeText` (`scheduled_time` for
+upcoming, `published_time` for live/concluded). Never infer the video date from
+numbers or date-looking text in its title.
+
+### Unified YouTube architecture
+
+All scrape/fallback/monitor paths go through `scrape_worker/youtube_core/`:
+
+| Layer | Role |
+|-------|------|
+| `client.py` | Playwright/HTML `ytInitialData` fetch, consent, `/streams`+`/videos`, operation-scoped cache |
+| `parser.py` | `lockupViewModel` + legacy `videoRenderer`; dates only from structured metadata |
+| `matching.py` | Ranking: video_id → title strategies → structured-date proximity |
+| `service.py` | Channel snapshot, stale-live skip, calendar overlay, stream-status |
+| `schedule/library/youtube.py` | Thin adapters: `youtube_table`, `youtube_table_la` (SAP filter), `youtube_table_md` (next per day) |
+| `utils/youtube.py` | Compatibility facade for dedicated parsers (download/API helpers retained) |
+
+Command job IDs + leases replace WallFly’s Bubble claim/verify. Ranking and
+Maryland/LA policies are retained; the legacy-only WallFly scraper is not.
+
 A meeting with no matching video must be returned with **no** `Meeting link`,
 `video_id`, or `Stream type` — an unmatched meeting is a valid result, not a
 failure. The coordinator drops any video that arrives on more than one meeting
@@ -307,8 +335,18 @@ calendar scrape itself fails and the channel becomes the source of meetings.
 |----------|-----------------|-----|
 | `live` | live | continues |
 | `upcoming` / `scheduled` | upcoming | continues |
+| `fetch_failed` / `unknown` | *(ignore / keep lease)* | **continues** — page could not be read; do **not** treat as adjourned |
 | `concluded` / `adjourned` / `ended` / `timeout` | adjourned | **done** |
 | **`skipped`** | adjourned | **done** (e.g. 24/7 stream — do **not** keep polling) |
+
+`fetch_failed` is returned when ytInitialData is missing/blocked after a poll.
+Command should renew the lease and wait for the next poll — never mark the
+meeting adjourned from a failed fetch alone. Successful absence of the owned
+`video_id` from the Live tab is still `concluded` (DetectEnd parity).
+
+Poll results may include `started_streaming_on`, `published_time`,
+`skipped_videos`, and `match_diagnostics` (video-id continuity / candidate
+counts). Title and date remain independent fields.
 
 Example final (skipped):
 
@@ -534,6 +572,8 @@ Loosen worker cold-start: accept fast (202), do heavy work async.
 - [ ] Scrape result posts meetings; adjourned + video_id feeds transcript queue.
 - [ ] Calendar `youtube_fallback.require_title_match` attaches video only on title+date match.
 - [ ] Monitor posts polls; **`skipped`** ends the job (no infinite loop).
+- [ ] Monitor treats **`fetch_failed` / `unknown`** as non-terminal (keep lease; do not adjourn).
+- [ ] Dates never come from video titles — only structured YouTube card metadata.
 - [ ] Transcript: Innertube → TranscriptAPI → PDF → multipart upload.
 - [ ] Transcript fail posts to `/v1/workers/transcripts/fail` (set `rate_limited` / `reason` when appropriate).
 - [ ] Same `WORKER_SHARED_TOKEN` on Command and worker; `COORDINATOR_URL` / `WORKER_PUBLIC_URL` correct.

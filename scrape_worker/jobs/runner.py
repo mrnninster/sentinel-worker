@@ -183,6 +183,8 @@ def _run_stream_status(
             return
 
         mapped = (status.get("status") or "").lower()
+        # fetch_failed / unknown are non-terminal: keep polling so a blocked or
+        # empty YouTube response cannot falsely conclude the meeting.
         terminal = mapped in {"concluded", "adjourned", "skipped"}
         body = {
             "worker_id": worker_id,
@@ -199,11 +201,13 @@ def _run_stream_status(
             "meeting_link": status.get("meeting_link"),
             "scheduled_time": status.get("scheduled_time"),
             "started_streaming_on": status.get("started_streaming_on"),
+            "published_time": status.get("published_time"),
             "note": status.get("note"),
             "live_videos": status.get("live_videos") or [],
             "upcoming_videos": status.get("upcoming_videos") or [],
             "concluded_on_page": status.get("concluded_on_page") or [],
             "skipped_videos": status.get("skipped_videos") or [],
+            "match_diagnostics": status.get("match_diagnostics"),
             "terminal": terminal,
         }
         _post_callback(callback_url, callback_token, body)

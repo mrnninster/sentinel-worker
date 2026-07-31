@@ -259,12 +259,32 @@ transcript endpoints.
 
 ### YouTube scrape notes
 
+YouTube scraping, calendar overlay, and stream-status share one core package:
+`scrape_worker/youtube_core/` (`client` → `parser` → `matching` → `service`).
+`schedule/library/youtube.py` is a thin adapter (`youtube_table` / `_la` / `_md`).
+`utils/youtube.py` is a compatibility facade for legacy dedicated parsers.
+
+```text
+Command ──► /scrape | /stream-status | commands
+              │
+              ├─ schedule adapters (youtube_table*) ──► YouTubeService
+              ├─ youtube_fallback overlay ───────────► YouTubeService
+              └─ stream-status monitor ──────────────► YouTubeService
+Legacy parsers ──► utils.youtube facade ─────────────► YouTubeService
+```
+
 For `schedule_type=youtube_table` (+ optional `youtube_fallback`):
 
 - Each of `/streams` and `/videos` is fetched **at most once** per scrape job; paths filter a shared classification.
 - Stream-status polls **clear** that cache each check so status can change to `concluded`.
 - Live cards with **Started streaming on …** (or “Started streaming N days ago”) older than **24 hours** are treated as always-on streams and **skipped** (not tracked as meeting lives). Override with `YOUTUBE_MAX_LIVE_AGE_HOURS`. Monitor jobs exit with `status: "skipped"`.
 - Calendar sources should set `youtube_fallback.require_title_match: true` so a channel VOD is attached only when **title and date** match. Date-only matching is skipped (avoids pinning one video onto every meeting that day). Unmatched meetings are returned without `Meeting link` / `video_id` / `Stream type`.
+- A video is only **date-matched** onto meetings newer than `youtube_fallback.max_meeting_age_hours` (default `24`), so a back-dated VOD cannot attach to a long-finished meeting. Exact `video_id` matches ignore the bound and still refresh status. Set `0` (or `null`) to allow backfill onto older meetings.
+- Candidate ranking order: explicit `video_id` → title strategies (exact / containment / keyword / Jaccard / fuzzy) → structured-date proximity; prefer live > upcoming > concluded. Used video ids are excluded so one VOD cannot attach twice.
+- Video title and date stay separate. The title is used only for title matching. The date comes from the card's structured `ytInitialData` (`metadataParts` on modern lockups or `publishedTimeText` on legacy cards): upcoming → `scheduled_time`; live/concluded → `published_time`. Relative page dates such as `2 days ago` are resolved at scrape time. No date is ever parsed from the title.
+- Monitor statuses are normalized once at the worker boundary: `live`, `upcoming`, `concluded`, `skipped`, `unknown`, `fetch_failed`. **`fetch_failed` / `unknown` are non-terminal** — a blocked or empty YouTube page must not falsely conclude a meeting. Command job IDs, heartbeats, and leases remain the ownership mechanism (no Bubble claim/verify loop).
+
+WallFly policies retained: LA SAP filter (`youtube_table_la`), Maryland next-meeting-per-day (`youtube_table_md`), DetectEnd “absent from Live tab ⇒ concluded” after a successful fetch, restart `video_id` continuity. Intentionally omitted: Bubble claim/verify detect loop and WallFly’s legacy-only `videoRenderer` scraper (Sentinel uses modern `lockupViewModel` + Playwright).
 
 Full Command ↔ worker contract: [WORKER_HANDOFF.md](./WORKER_HANDOFF.md).
 
@@ -299,8 +319,10 @@ jobs/runner.py          One-off/thread entrypoint (scrape | stream_status | tran
 jobs/transcript.py      Innertube/TranscriptAPI retrieval + PDF upload
 scraper_bridge.py       embedded | http scrape bridge
 app/                    Schedule scrape FastAPI + LLM pipeline
-schedule/library/       Dedicated platform parsers
-utils/                  HTML / Playwright / YouTube helpers
+youtube_core/           Unified YouTube client/parser/matcher/service
+schedule/library/       Dedicated platform parsers (+ thin YouTube adapter)
+utils/                  HTML / Playwright helpers; YouTube compatibility facade
+tests/youtube/          Fixture-driven YouTube parity tests
 .env.example            All env vars
 ```
 

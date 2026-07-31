@@ -20,9 +20,10 @@ def check_youtube_stream_status(
     """
     Metadata-only status check (no HLS / stream download).
 
-    WallFly equivalent: utils.youtube.Youtube.get_live_videos +
-    DetectEnd.ts_youtube (video still in LIVE overlay list ⇒ live;
-    absent ⇒ concluded).
+    Uses the unified ``youtube_core`` path via the schedule adapter.
+    Explicit ``video_id`` continuity is preferred for restarted monitors.
+    ``fetch_failed`` / ``unknown`` mean the page could not be read — callers
+    must keep polling and must not treat those as concluded.
     """
     yt = Youtube()
     return yt.check_stream_status(

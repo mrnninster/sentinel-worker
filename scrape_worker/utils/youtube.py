@@ -1,13 +1,11 @@
 import os
 import re
-import json
 import pytz
 from tqdm import tqdm
 from datetime import datetime
 from pytubefix import YouTube as YT
 from googleapiclient.discovery import build
 import requests
-from fuzzywuzzy import fuzz
 from dotenv import load_dotenv
 
 from logging_config import get_dedicated_debug_logger, LOG_LEVEL
@@ -19,229 +17,23 @@ load_dotenv()
 
 
 # =============================================================================
-# Fuzzy Matching Utilities (used by detect.py and youtube_watcher.py)
+# Fuzzy Matching Utilities — compatibility facade over youtube_core.matching
 # =============================================================================
 
+from youtube_core.matching import (  # noqa: E402
+    find_best_match,
+    fuzzy_match_confidence,
+    normalize_for_matching,
+    title_match_details,
+)
 
-def normalize_for_matching(text: str) -> str:
-    """
-    Normalize text for fuzzy matching by removing common noise.
-
-    Handles:
-    - Lowercase conversion
-    - & → and
-    - Punctuation removal
-    - Common noise words (committee, subcommittee, senate, house, of, the, virginia)
-    - Legislative prefixes like "Senate of Virginia:"
-    - Date suffixes like "on 2026-01-27"
-    - Status tags like [Finished], [Live]
-
-    Example:
-        'Senate of Virginia: Finance & Appropriations on 2026-01-27 [Finished]'
-        -> 'finance appropriations'
-    """
-    if not text:
-        return ""
-
-    text = text.lower()
-
-    # Remove common legislative prefixes
-    prefixes_to_remove = [
-        r"^senate of virginia:\s*",
-        r"^virginia senate:\s*",
-        r"^house of delegates:\s*",
-        r"^virginia house:\s*",
-        r"^commonwealth of virginia:\s*",
-    ]
-    for prefix in prefixes_to_remove:
-        text = re.sub(prefix, "", text, flags=re.IGNORECASE)
-
-    # Remove date suffixes like "on 2026-01-27" or "on January 27, 2026"
-    text = re.sub(r"\s+on\s+\d{4}-\d{2}-\d{2}.*$", "", text)
-    text = re.sub(
-        r"\s+on\s+[a-z]+\s+\d{1,2},?\s+\d{4}.*$", "", text, flags=re.IGNORECASE
-    )
-
-    # Remove status tags like [Finished], [Live], [Ended]
-    text = re.sub(r"\s*\[.*?\]\s*", " ", text)
-
-    # Replace & with 'and'
-    text = re.sub(r"&", " and ", text)
-
-    # Remove punctuation (keep alphanumeric and spaces)
-    text = re.sub(r"[^\w\s]", " ", text)
-
-    # Normalize whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-
-    # Remove common noise words
-    noise_words = {
-        "committee",
-        "subcommittee",
-        "senate",
-        "house",
-        "of",
-        "the",
-        "virginia",
-        "commonwealth",
-        "joint",
-        "special",
-        "select",
-        "standing",
-    }
-    tokens = [t for t in text.split() if t not in noise_words]
-
-    return " ".join(tokens)
-
-
-def fuzzy_match_confidence(calendar_name: str, youtube_title: str) -> float:
-    """
-    Calculate fuzzy match confidence between a calendar meeting name and YouTube title.
-
-    Uses Jaccard similarity on normalized tokens.
-
-    Args:
-        calendar_name: Meeting name from calendar (e.g., "Finance and Appropriations")
-        youtube_title: YouTube stream title (e.g., "Senate of Virginia: Finance &
-                       Appropriations on 2026-01-27 [Finished]")
-
-    Returns:
-        float: Confidence score 0.0 to 1.0. Threshold of 0.3 is recommended for
-               lenient matching.
-
-    Example:
-        >>> fuzzy_match_confidence("Finance and Appropriations",
-        ...     "Senate of Virginia: Finance & Appropriations on 2026-01-27")
-        1.0  # Perfect match after normalization
-    """
-    cal_normalized = normalize_for_matching(calendar_name)
-    yt_normalized = normalize_for_matching(youtube_title)
-
-    if not cal_normalized or not yt_normalized:
-        return 0.0
-
-    # Token-based Jaccard similarity
-    cal_tokens = set(cal_normalized.split())
-    yt_tokens = set(yt_normalized.split())
-
-    if not cal_tokens or not yt_tokens:
-        return 0.0
-
-    overlap = len(cal_tokens & yt_tokens)
-    union = len(cal_tokens | yt_tokens)
-
-    return overlap / union if union > 0 else 0.0
-
-
-def title_match_details(
-    calendar_name: str,
-    youtube_title: str,
-    *,
-    jaccard_threshold: float = 0.3,
-    keyword_threshold: float = 0.6,
-    fuzzy_threshold: float = 0.7,
-) -> tuple[float, str | None]:
-    """Match titles using exact, containment, keyword, Jaccard, and fuzzy signals.
-
-    Every strategy is evaluated. The strongest accepted strategy is returned as
-    ``(confidence, match_type)``. Requiring two shared keywords for non-exact
-    matches prevents generic one-word overlaps such as "Council" from attaching
-    the wrong video.
-    """
-    calendar = normalize_for_matching(calendar_name)
-    youtube = normalize_for_matching(youtube_title)
-    if not calendar or not youtube:
-        return 0.0, None
-
-    calendar_tokens = set(calendar.split())
-    youtube_tokens = set(youtube.split())
-    common = calendar_tokens & youtube_tokens
-
-    if calendar == youtube:
-        return 1.0, "exact"
-
-    shorter, longer = sorted((calendar, youtube), key=len)
-    if (
-        shorter in longer
-        and (len(shorter.split()) >= 2 or calendar_tokens == youtube_tokens)
-    ):
-        return 0.98, "containment"
-
-    fuzzy = fuzz.token_set_ratio(calendar, youtube) / 100.0
-
-    # A high fuzzy score can recover misspellings even when tokens differ.
-    typo_threshold = 0.82 if not common else 0.92
-    if (
-        len(common) < 2
-        and len(calendar_tokens) >= 2
-        and len(youtube_tokens) >= 2
-        and fuzzy >= max(fuzzy_threshold, typo_threshold)
-    ):
-        return fuzzy, "fuzzy"
-
-    # Other non-exact strategies need at least two meaningful shared tokens.
-    if len(common) < 2:
-        return 0.0, None
-
-    candidates: list[tuple[float, str]] = []
-    union = calendar_tokens | youtube_tokens
-    jaccard = len(common) / len(union) if union else 0.0
-    if jaccard >= jaccard_threshold:
-        candidates.append((jaccard, "token_jaccard"))
-
-    keyword_coverage = len(common) / min(len(calendar_tokens), len(youtube_tokens))
-    if keyword_coverage >= keyword_threshold:
-        candidates.append((keyword_coverage, "keyword_intersection"))
-
-    if fuzzy >= fuzzy_threshold:
-        candidates.append((fuzzy, "fuzzy"))
-
-    return max(candidates, default=(0.0, None), key=lambda candidate: candidate[0])
-
-
-def find_best_match(
-    meeting_title: str, live_videos: list, threshold: float = 0.3
-) -> tuple:
-    """
-    Find the best matching live video for a meeting title.
-
-    Args:
-        meeting_title: The calendar meeting title to match
-        live_videos: List of dicts with 'video_id' and 'video_title' keys
-        threshold: Minimum confidence threshold (default 0.3 for lenient matching)
-
-    Returns:
-        tuple: (video_data, confidence, match_type) or (None, 0.0, None) if no match
-
-    Match types:
-        - 'exact': meeting_title found verbatim in video_title
-        - 'fuzzy': fuzzy match above threshold
-        - None: no match found
-    """
-    if not live_videos or not meeting_title:
-        return None, 0.0, None
-
-    best_match = None
-    best_confidence = 0.0
-    match_type = None
-
-    for video_data in live_videos:
-        video_title = video_data.get("video_title", "")
-
-        confidence, candidate_type = title_match_details(
-            meeting_title,
-            video_title,
-            jaccard_threshold=threshold,
-        )
-        if confidence > best_confidence:
-            best_confidence = confidence
-            best_match = video_data
-            match_type = candidate_type
-
-    if best_confidence >= threshold:
-        return best_match, best_confidence, match_type
-
-    return None, best_confidence, None
+# Re-export for legacy `from utils.youtube import …` callers.
+__all_matching__ = (
+    "normalize_for_matching",
+    "fuzzy_match_confidence",
+    "title_match_details",
+    "find_best_match",
+)
 
 
 if os.getenv("ENV", "").lower() == "local":
@@ -450,166 +242,71 @@ class Youtube:
                 log.warning(f"Second attempt failed. Error: {e}", exc_info=True)
                 return "download failed"
 
-    def get_live_videos(self, soup):
+    def get_live_videos(self, soup=None, channel_url: str | None = None):
         """
-        This function returns a list of live video objects
-        or None when there are no live videos.
+        Live videos on the channel Live tab (metadata only).
 
-        Params:
-        -------
-        soup: The scraper object.
-
-        Returns:
-        -------
-        live video object | None:
-            Object sample:
-                [
-                    {
-                        "video_id": video_id,
-                        "video_title": title
-                    }
-                ]
+        Prefers ``channel_url`` (Playwright + modern lockup UI). When only
+        ``soup`` is provided (legacy calendar parsers), parses ytInitialData
+        via ``youtube_core`` so lockupViewModel cards are not skipped.
         """
-        self.live_videos_data = []
-        script_tags = soup.find_all("script")
-        pattern = re.compile(r"var ytInitialData = ")
+        from youtube_core.service import YouTubeService
 
-        for script in script_tags:
-            if script.string and pattern.search(script.string):
-                start_pos = script.string.find("var ytInitialData = ") + len(
-                    "var ytInitialData = "
-                )
-                json_str = script.string[start_pos:]
-
-                # Find the end of the JSON object
-                brace_count = 0
-                for i, char in enumerate(json_str):
-                    if char == "{":
-                        brace_count += 1
-                    elif char == "}":
-                        brace_count -= 1
-                    if brace_count == 0 and i > 0:
-                        json_str = json_str[: i + 1]
-                        break
-
-                try:
-                    yt_initial_data = json.loads(json_str)
-                    data = yt_initial_data["contents"][
-                        "twoColumnBrowseResultsRenderer"
-                    ]["tabs"]
-
-                    for element_i in data:
-                        if (
-                            element_i[list(element_i.keys())[0]]["title"].lower()
-                            == "live"
-                        ):
-                            log.info("Found LIVE tab")
-                            live_tab = element_i
-                            live_tab_content = live_tab["tabRenderer"]["content"][
-                                "richGridRenderer"
-                            ]["contents"]
-
-                            for content in live_tab_content:
-                                if "continuationItemRenderer" not in content.keys():
-                                    try:
-                                        # Defensive check: ensure we have the
-                                        # expected structure
-                                        if "richItemRenderer" not in content:
-                                            log.warning(
-                                                f"Skipping item - missing richItemRenderer. Keys found: {list(content.keys())}"
-                                            )
-                                            continue
-
-                                        rich_content = content["richItemRenderer"].get(
-                                            "content", {}
-                                        )
-
-                                        # Check for videoRenderer (standard
-                                        # videos)
-                                        if "videoRenderer" not in rich_content:
-                                            # Log the actual renderer type
-                                            # found for debugging
-                                            renderer_types = list(rich_content.keys())
-                                            log.warning(
-                                                f"Skipping non-video content. Renderer type(s) found: {renderer_types}"
-                                            )
-                                            continue
-
-                                        video_data = rich_content["videoRenderer"]
-
-                                        # Safely check if video is live
-                                        is_live = False
-                                        if (
-                                            "thumbnailOverlays" in video_data
-                                            and len(video_data["thumbnailOverlays"]) > 0
-                                        ):
-                                            overlay = video_data["thumbnailOverlays"][0]
-                                            if (
-                                                "thumbnailOverlayTimeStatusRenderer"
-                                                in overlay
-                                            ):
-                                                status_text = overlay[
-                                                    "thumbnailOverlayTimeStatusRenderer"
-                                                ].get("text", {})
-                                                accessibility = status_text.get(
-                                                    "accessibility", {}
-                                                )
-                                                accessibility_data = accessibility.get(
-                                                    "accessibilityData", {}
-                                                )
-                                                label = accessibility_data.get(
-                                                    "label", ""
-                                                ).lower()
-                                                is_live = label == "live"
-
-                                    except Exception as e:
-                                        log.warning(
-                                            f"Error parsing video live status: {e}",
-                                            exc_info=True,
-                                        )
-                                        continue
-
-                                    if is_live:
-                                        video_id = video_data["videoId"]
-                                        title = video_data["title"]["runs"][0]["text"]
-                                        video_object = {
-                                            "video_id": video_id,
-                                            "video_title": title,
-                                        }
-                                        log.debug(video_object)
-                                        self.live_videos_data.append(video_object)
-
-                            if self.live_videos_data.count == 0:
-                                self.live_videos_data = None
-                                log.info("No live Video Detected")
-
-                except json.JSONDecodeError as e:
-                    log.warning(f"Error parsing JSON: {e}", exc_info=True)
-
-        return self.live_videos_data
+        service = YouTubeService()
+        url = channel_url or (self.url if self.is_valid_youtube_streams_url() else None)
+        live = service.get_live_videos(channel_url=url, soup=soup)
+        self.live_videos_data = live or None
+        if not live:
+            log.info("No live Video Detected")
+            return None
+        return live
 
     def match_meet(self, use_time_check=True):
         """
-        Matches the meet using time or meet title.
+        Matches the meet using restart video id, title, or start-time proximity.
 
         Returns:
         -------
-        video_id: The id of the qualifying live stream or None.
+        video_id: The id of the qualifying live stream or None / "terminated".
         """
+        if not self.live_videos_data:
+            return None
 
-        if self.youtube_restart_ID:  # substitute known ID
+        if self.youtube_restart_ID:  # substitute known ID (monitor restart continuity)
             for video_data in self.live_videos_data:
                 if self.youtube_restart_ID == video_data["video_id"]:
                     return self.youtube_restart_ID
-            os.environ.pop("ARG_YOUTUBE_RESTART_ID")
+            os.environ.pop("ARG_YOUTUBE_RESTART_ID", None)
             return "terminated"
 
         base = float(3600 * 3)
         stream_id = None
-        time_diff = None
         current_time = datetime.now(pytz.utc)
 
-        # Get LiveStream starttime
+        # Prefer modern title ranking before the Data API time check.
+        best, confidence, match_type = find_best_match(
+            self.meeting_title, self.live_videos_data, threshold=0.3
+        )
+        if best and match_type:
+            log.info(
+                "Detected meeting by title (%s, %.2f): %s",
+                match_type,
+                confidence,
+                best.get("video_title"),
+            )
+            return best["video_id"]
+
+        if self.meeting_title:
+            for video_data in self.live_videos_data:
+                if self.meeting_title in video_data.get("video_title", ""):
+                    log.info(
+                        "Detected meeting by name: %s", video_data["video_title"]
+                    )
+                    return video_data["video_id"]
+
+        if not use_time_check:
+            return None
+
         Utube = build(
             serviceName="youtube",
             version="v3",
@@ -622,8 +319,8 @@ class Youtube:
                 part="snippet,liveStreamingDetails", id=video_data["video_id"]
             )
             response = request.execute()
-
-            # Add Stream Start Time
+            if not response.get("items"):
+                continue
             if "liveStreamingDetails" in response["items"][0]:
                 video_data["start_time"] = datetime.fromisoformat(
                     response["items"][0]["liveStreamingDetails"][
@@ -631,21 +328,16 @@ class Youtube:
                     ].replace("Z", "+00:00")
                 )
 
-            # Direct Name check
-            if self.meeting_title in video_data["video_title"]:
-                log.info(f"Detected meeting by name: {video_data['video_title']}")
-                return video_data["video_id"]
-
-            # Time Check
-            if use_time_check:
-                log.debug(
-                    f"video_id => {video_data['video_id']}, start_time => {video_data['start_time']}"
-                )
-                time_diff = abs(
-                    (current_time - video_data["start_time"]).total_seconds()
-                )
-                if time_diff < base:
-                    base = time_diff
-                    stream_id = video_data["video_id"]
+            if "start_time" not in video_data:
+                continue
+            log.debug(
+                "video_id => %s, start_time => %s",
+                video_data["video_id"],
+                video_data["start_time"],
+            )
+            time_diff = abs((current_time - video_data["start_time"]).total_seconds())
+            if time_diff < base:
+                base = time_diff
+                stream_id = video_data["video_id"]
 
         return stream_id

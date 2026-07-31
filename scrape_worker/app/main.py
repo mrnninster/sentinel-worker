@@ -136,6 +136,12 @@ def _map_stream_videos(items: list[dict]) -> list[StreamVideoInfo]:
                 video_title=item.get("video_title") or item.get("Meeting name") or "",
                 meeting_link=item.get("meeting_link") or item.get("Meeting link"),
                 scheduled_time=item.get("scheduled_time") or item.get("Scheduled time"),
+                published_time=item.get("published_time"),
+                started_streaming_on=item.get("started_streaming_on"),
+                youtube_date_text=item.get("youtube_date_text"),
+                note=item.get("note"),
+                match_type=item.get("match_type"),
+                match_confidence=item.get("match_confidence"),
             )
         )
     return mapped
@@ -149,6 +155,9 @@ async def stream_status(body: StreamStatusRequest) -> StreamStatusResponse:
     Metadata only (same signal as WallFly `get_live_videos` /
     `DetectEnd.ts_youtube`): scrapes the channel `/streams` page and reads
     Live-tab badges. Does **not** download or probe stream media.
+
+    ``fetch_failed`` / ``unknown`` mean the page could not be read — callers
+    must not treat those as a concluded meeting.
     """
     import asyncio
 
@@ -174,9 +183,13 @@ async def stream_status(body: StreamStatusRequest) -> StreamStatusResponse:
         video_title=raw.get("video_title"),
         meeting_link=raw.get("meeting_link"),
         scheduled_time=raw.get("scheduled_time"),
+        published_time=raw.get("published_time"),
+        started_streaming_on=raw.get("started_streaming_on"),
         live_videos=_map_stream_videos(raw.get("live_videos") or []),
         upcoming_videos=_map_stream_videos(raw.get("upcoming_videos") or []),
         concluded_on_page=_map_stream_videos(raw.get("concluded_on_page") or []),
+        skipped_videos=_map_stream_videos(raw.get("skipped_videos") or []),
         channel_url=raw.get("channel_url") or str(body.channel_url),
         note=raw.get("note"),
+        match_diagnostics=raw.get("match_diagnostics"),
     )

@@ -30,8 +30,19 @@ class YoutubeFallbackConfig(BaseModel):
     match: Literal["title_date", "video_id"] = Field(
         default="title_date",
         description=(
-            "title_date = match by date parsed from VOD title (and scheduled time). "
+            "title_date = compare the calendar date with YouTube's structured "
+            "ytInitialData date, optionally requiring a title match too. The worker "
+            "never derives a date from the video title. "
             "video_id = match only via Meeting link / known video id."
+        ),
+    )
+    max_meeting_age_hours: Optional[float] = Field(
+        default=24.0,
+        description=(
+            "Only date-match a channel video onto meetings newer than this many "
+            "hours (default 24). Stops a back-dated VOD from being pinned onto a "
+            "long-finished meeting. Exact video_id matches always refresh status. "
+            "Set 0/null to disable the bound."
         ),
     )
     require_title_match: bool = Field(
@@ -208,14 +219,29 @@ class StreamVideoInfo(BaseModel):
     video_title: str
     meeting_link: Optional[str] = None
     scheduled_time: Optional[str] = None
+    published_time: Optional[str] = None
+    started_streaming_on: Optional[str] = None
+    youtube_date_text: Optional[str] = None
+    note: Optional[str] = None
+    match_type: Optional[str] = None
+    match_confidence: Optional[float] = None
 
 
 class StreamStatusResponse(BaseModel):
-    status: Literal["live", "upcoming", "concluded", "channel_snapshot", "skipped"]
+    status: Literal[
+        "live",
+        "upcoming",
+        "concluded",
+        "channel_snapshot",
+        "skipped",
+        "unknown",
+        "fetch_failed",
+    ]
     video_id: Optional[str] = None
     video_title: Optional[str] = None
     meeting_link: Optional[str] = None
     scheduled_time: Optional[str] = None
+    published_time: Optional[str] = None
     started_streaming_on: Optional[str] = None
     live_videos: list[StreamVideoInfo] = Field(default_factory=list)
     upcoming_videos: list[StreamVideoInfo] = Field(default_factory=list)
@@ -223,3 +249,4 @@ class StreamStatusResponse(BaseModel):
     skipped_videos: list[StreamVideoInfo] = Field(default_factory=list)
     channel_url: str
     note: Optional[str] = None
+    match_diagnostics: Optional[dict] = None
