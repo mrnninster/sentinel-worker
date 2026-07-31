@@ -43,7 +43,7 @@ One `.env` in this directory (see `.env.example`). Important keys:
 | `HEROKU_DYNO_SIZE` | One-off size (`standard-1x` default) |
 | `INTERNAL_CALLBACK_TOKEN` | Job→middleman Bearer (defaults to shared token) |
 | `TRANSCRIPTAPI_API_KEY` | TranscriptAPI fallback when YouTube Innertube is blocked |
-| `WORKER_HEARTBEAT_SECONDS` | Periodic heartbeat interval (default `30`) |
+| `WORKER_HEARTBEAT_SECONDS` | Periodic heartbeat interval (default `60`) |
 | `COORDINATOR_RETRY_ATTEMPTS` | Result relay attempts (default `3`); exponential backoff starts at 5s and doubles |
 | `COORDINATOR_PENDING_MAX` | Results buffered while Command is down (default `500`, `0` disables) |
 | `SHUTDOWN_GRACE_SECONDS` | Wait for browser children on shutdown before SIGKILL (default `5`) |

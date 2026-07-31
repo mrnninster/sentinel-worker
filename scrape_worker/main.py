@@ -340,7 +340,7 @@ async def _notify_load(*, reason: str = "heartbeat") -> None:
 
 
 async def _heartbeat_loop() -> None:
-    interval = int(os.environ.get("WORKER_HEARTBEAT_SECONDS") or "30")
+    interval = int(os.environ.get("WORKER_HEARTBEAT_SECONDS") or "60")
     while True:
         await _notify_load(reason="heartbeat")
         await _flush_pending_relays()
