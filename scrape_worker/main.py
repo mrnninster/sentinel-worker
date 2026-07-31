@@ -14,7 +14,8 @@ from typing import Annotated, Any, AsyncIterator
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
@@ -33,6 +34,15 @@ from dispatch.spawner import (
     shutdown_dispatch,
     use_heroku,
 )
+from log_buffer import (
+    DOWNLOAD_DAYS,
+    current_file_size,
+    export_logs_text,
+    install_log_buffer,
+    query_logs,
+    stats as log_buffer_stats,
+    wait_for_entries_after,
+)
 from scraper_bridge import scraper_mode
 
 __version__ = "2.0.0"
@@ -41,6 +51,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
+install_log_buffer()
 log = logging.getLogger("scrape_worker")
 
 _allowed_sources: list[str] = ["*"]
@@ -96,6 +107,45 @@ def _worker_capacity() -> int:
             except ValueError:
                 pass
     return 50
+
+
+def _admin_token() -> str:
+    """Token for the browser log viewer (defaults to WORKER_SHARED_TOKEN)."""
+    return (
+        os.environ.get("ADMIN_TOKEN")
+        or os.environ.get("WORKER_SHARED_TOKEN")
+        or os.environ.get("WORKER_TOKEN")
+        or ""
+    ).strip()
+
+
+def _token_matches(provided: str | None, expected: str) -> bool:
+    if not expected or not provided:
+        return False
+    try:
+        return secrets.compare_digest(provided.strip(), expected)
+    except (TypeError, ValueError):
+        return False
+
+
+def require_admin_token(
+    request: Request,
+    token: Annotated[str | None, Query()] = None,
+    authorization: Annotated[str | None, Header()] = None,
+) -> str:
+    """Accept admin token via ?token= or Authorization: Bearer."""
+    expected = _admin_token()
+    if not expected:
+        raise HTTPException(503, "ADMIN_TOKEN / WORKER_SHARED_TOKEN not configured")
+    bearer = None
+    if authorization and authorization.lower().startswith("bearer "):
+        bearer = authorization.split(" ", 1)[1].strip()
+    # Prefer query token for browser pages, then Bearer.
+    candidates = [token, bearer, request.cookies.get("worker_admin_token")]
+    for candidate in candidates:
+        if _token_matches(candidate, expected):
+            return expected
+    raise HTTPException(401, "Invalid or missing admin token")
 
 
 def require_worker_auth(
@@ -380,6 +430,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     pool.max_oneoff = _worker_capacity()
     # A --reload restart reuses the interpreter; clear any stale shutdown flag.
     clear_shutdown()
+    install_log_buffer()
+    log.info("Log buffer ready (retention=%sh)", 6)
 
     await _register_with_coordinator()
     _heartbeat_task = asyncio.create_task(_heartbeat_loop(), name="worker-heartbeat")
@@ -416,6 +468,191 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
+
+
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request, token: Annotated[str | None, Query()] = None) -> HTMLResponse:
+    """Admin log viewer. Open with ?token=… or submit the login form."""
+    from admin_logs_page import logs_login_html, logs_viewer_html
+
+    expected = _admin_token()
+    if not expected:
+        return HTMLResponse(
+            logs_login_html(error="ADMIN_TOKEN / WORKER_SHARED_TOKEN is not configured."),
+            status_code=503,
+        )
+    provided = token or request.cookies.get("worker_admin_token")
+    if not provided:
+        return HTMLResponse(logs_login_html())
+    if not _token_matches(provided, expected):
+        return HTMLResponse(
+            logs_login_html(error="Invalid admin token."),
+            status_code=401,
+        )
+    response = HTMLResponse(
+        logs_viewer_html(token=provided.strip(), worker_id=_worker_id())
+    )
+    response.set_cookie(
+        "worker_admin_token",
+        provided.strip(),
+        httponly=True,
+        samesite="lax",
+        max_age=12 * 3600,
+    )
+    return response
+
+
+@app.get("/v1/admin/logs")
+def admin_logs(
+    _: str = Depends(require_admin_token),
+    since: Annotated[str | None, Query()] = None,
+    until: Annotated[str | None, Query()] = None,
+    q: Annotated[str | None, Query()] = None,
+    level: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=10000)] = 2000,
+) -> dict:
+    """One-shot JSON snapshot (used rarely; prefer /v1/admin/logs/stream)."""
+    from datetime import datetime
+
+    def _parse_ts(raw: str | None) -> float | None:
+        if not raw:
+            return None
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError as exc:
+            raise HTTPException(400, f"Invalid timestamp: {raw}") from exc
+
+    entries = query_logs(
+        since=_parse_ts(since),
+        until=_parse_ts(until),
+        q=q,
+        level=level,
+        limit=limit,
+    )
+    return {
+        "ok": True,
+        "stats": log_buffer_stats(),
+        "entries": [e.to_dict() for e in entries],
+    }
+
+
+@app.get("/v1/admin/logs/stream")
+async def admin_logs_stream(
+    request: Request,
+    _: str = Depends(require_admin_token),
+    since: Annotated[str | None, Query()] = None,
+    q: Annotated[str | None, Query()] = None,
+    level: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=10000)] = 5000,
+) -> StreamingResponse:
+    """Realtime log stream (SSE). One long-lived connection; no polling."""
+    import json
+    from datetime import datetime
+
+    def _parse_ts(raw: str | None) -> float | None:
+        if not raw:
+            return None
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError as exc:
+            raise HTTPException(400, f"Invalid timestamp: {raw}") from exc
+
+    since_ts = _parse_ts(since)
+
+    async def event_gen():
+        snapshot = await asyncio.to_thread(
+            query_logs,
+            since=since_ts,
+            until=None,
+            q=q,
+            level=level,
+            limit=limit,
+        )
+        # Tail from the current end of worker.log so we only stream new writes.
+        cursor = current_file_size()
+        st = log_buffer_stats()
+        payload = {
+            "stats": st,
+            "entries": [e.to_dict() for e in snapshot],
+        }
+        yield f"event: snapshot\ndata: {json.dumps(payload)}\n\n"
+
+        while True:
+            if await request.is_disconnected():
+                break
+            matched, cursor = await asyncio.to_thread(
+                wait_for_entries_after,
+                cursor,
+                timeout=1.5,
+                q=q,
+                level=level,
+            )
+            if matched:
+                yield (
+                    "event: entries\ndata: "
+                    + json.dumps(
+                        {
+                            "stats": log_buffer_stats(),
+                            "entries": [e.to_dict() for e in matched],
+                        }
+                    )
+                    + "\n\n"
+                )
+            else:
+                # Keepalive + light stats so the UI can show "live" without refetching.
+                yield (
+                    "event: ping\ndata: "
+                    + json.dumps({"stats": log_buffer_stats()})
+                    + "\n\n"
+                )
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/v1/admin/logs/download")
+def admin_logs_download(
+    _: str = Depends(require_admin_token),
+    days: Annotated[int, Query(ge=1, le=31)] = DOWNLOAD_DAYS,
+    q: Annotated[str | None, Query()] = None,
+    level: Annotated[str | None, Query()] = None,
+) -> Response:
+    """Download on-disk logs for the last N calendar days (default 7, includes today)."""
+    from datetime import datetime, timezone
+
+    text, files = export_logs_text(days=days, q=q, level=level)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    filename = f"worker-logs-{_worker_id()}-{days}d-{stamp}.log"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Log-Files": ",".join(files) if files else "",
+    }
+    return PlainTextResponse(content=text or "# no log files found\n", headers=headers)
 
 
 @app.get("/health")

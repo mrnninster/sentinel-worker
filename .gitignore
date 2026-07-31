@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 .env
+scrape_worker/data/logs/

@@ -55,6 +55,12 @@ def get_dedicated_debug_logger(name: str) -> logging.Logger:
         handler.setLevel(logging.DEBUG)
         handler.setFormatter(CustomFormatter())
         log.addHandler(handler)
+    try:
+        from log_buffer import attach_to_logger
+
+        attach_to_logger(log)
+    except Exception:
+        pass
     return log
 
 
