@@ -41,14 +41,6 @@
       "description": "Max concurrent one-off jobs (pool capacity)",
       "value": "50"
     },
-    "SPAWN_RATE_MAX": {
-      "description": "Max one-off starts per SPAWN_RATE_WINDOW_SECONDS (0 = unlimited)",
-      "value": "2"
-    },
-    "SPAWN_RATE_WINDOW_SECONDS": {
-      "description": "Sliding window for SPAWN_RATE_MAX",
-      "value": "15"
-    },
     "RESERVE_SCRAPE": {
       "description": "Slots reserved for schedule scrapes",
       "value": "1"

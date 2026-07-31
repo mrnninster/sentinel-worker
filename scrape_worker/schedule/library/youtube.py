@@ -81,9 +81,9 @@ class Youtube(YouTubeService):
             )
 
         if YoutubeUtils is not None:
-            youtube_utils = YoutubeUtils(url=channel_url, meeting_title="")
-            if not youtube_utils.is_valid_youtube_streams_url():
-                raise ValueError(f"Invalid YouTube channel URL format: {channel_url}")
+        youtube_utils = YoutubeUtils(url=channel_url, meeting_title="")
+        if not youtube_utils.is_valid_youtube_streams_url():
+            raise ValueError(f"Invalid YouTube channel URL format: {channel_url}")
 
         all_meetings = self.youtube_table(channel_url, timezone)
         if not all_meetings:
@@ -95,7 +95,7 @@ class Youtube(YouTubeService):
         live_videos: list[str] = []
         try:
             live_videos_data = self.get_live_videos(channel_url=channel_url)
-            if live_videos_data:
+                if live_videos_data:
                 live_videos = [v.get("video_id") for v in live_videos_data if v.get("video_id")]
         except Exception:
             log.exception("Error checking live videos in youtube_table_md")
