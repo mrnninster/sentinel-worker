@@ -16,6 +16,12 @@ from dispatch.pool import QueuedJob, pool
 
 log = logging.getLogger(__name__)
 
+# Background drain so /v1/commands/* can return 202 without waiting on Heroku API.
+_drain_task: Optional[asyncio.Task[Any]] = None
+_drain_again = False
+# Cap parallel Platform API creates during a batch accept burst.
+_SPAWN_CONCURRENCY = max(1, int(os.environ.get("HEROKU_SPAWN_CONCURRENCY") or "5"))
+
 
 def _dispatch_mode() -> str:
     mode = (os.environ.get("DISPATCH_MODE") or "auto").strip().lower()
@@ -127,37 +133,90 @@ async def spawn_job(job: QueuedJob) -> Any:
 
 
 async def drain_pool() -> int:
-    """Start as many queued jobs as capacity allows. Returns number started."""
-    # A late job callback can arrive while lifespan shutdown is killing dynos.
-    # Never let its release-and-drain path start replacement work.
+    """Start as many queued jobs as capacity allows. Returns number started.
+
+    Slots are reserved with mark_running immediately after each pop so a
+    concurrent batch cannot oversubscribe HEROKU_ONEOFF_LIMIT. Heroku one-off
+    creates then run concurrently (bounded) so a scrape-batch burst does not
+    serialize on the Platform API.
+    """
     if is_shutting_down():
         return 0
-    started = 0
+
+    # Reserve capacity first (pop + mark), then spawn in parallel.
+    reserved: list[QueuedJob] = []
     while True:
         job = pool.pop_next_runnable()
         if not job:
             break
-        try:
-            handle = await spawn_job(job)
-        except Exception:
-            log.exception("Spawn failed job_id=%s — re-queue", job.job_id)
-            # Put back at front of its queue
-            pool.queues[job.load_type].appendleft(job)
-            pool.queued_ids[job.job_id] = job.load_type
-            break
-        pool.mark_running(job, handle=handle)
-        started += 1
-        log.info(
-            "Dispatched job_id=%s type=%s mode=%s",
-            job.job_id,
-            job.load_type,
-            "heroku" if use_heroku() else "local",
-        )
+        pool.mark_running(job, handle=None)
+        reserved.append(job)
+
+    if not reserved:
+        return 0
+
+    sem = asyncio.Semaphore(_SPAWN_CONCURRENCY)
+    started = 0
+
+    async def _spawn_one(job: QueuedJob) -> None:
+        nonlocal started
+        async with sem:
+            if is_shutting_down():
+                pool.release(job.job_id)
+                pool.queues[job.load_type].appendleft(job)
+                pool.queued_ids[job.job_id] = job.load_type
+                return
+            try:
+                handle = await spawn_job(job)
+            except Exception:
+                log.exception("Spawn failed job_id=%s — re-queue", job.job_id)
+                pool.release(job.job_id)
+                pool.queues[job.load_type].appendleft(job)
+                pool.queued_ids[job.job_id] = job.load_type
+                return
+            running = pool.running.get(job.job_id)
+            if running is not None:
+                running.handle = handle
+            started += 1
+            log.info(
+                "Dispatched job_id=%s type=%s mode=%s",
+                job.job_id,
+                job.load_type,
+                "heroku" if use_heroku() else "local",
+            )
+
+    await asyncio.gather(*(_spawn_one(job) for job in reserved))
     return started
 
 
+def _schedule_drain() -> None:
+    """Fire-and-forget drain; coalesces overlapping schedules into one task."""
+    global _drain_task, _drain_again
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    if _drain_task is not None and not _drain_task.done():
+        _drain_again = True
+        return
+
+    async def _run() -> None:
+        global _drain_again
+        try:
+            while True:
+                _drain_again = False
+                await drain_pool()
+                if not _drain_again:
+                    break
+        except Exception:
+            log.exception("Background drain failed")
+
+    _drain_task = loop.create_task(_run(), name="drain-pool")
+
+
 async def enqueue_and_drain(job: QueuedJob) -> dict[str, Any]:
-    """Enqueue then try to dispatch. Returns accept metadata."""
+    """Enqueue and schedule dispatch without blocking the HTTP accept path."""
     if not pool.enqueue(job):
         return {
             "ok": True,
@@ -166,14 +225,14 @@ async def enqueue_and_drain(job: QueuedJob) -> dict[str, Any]:
             "job_id": job.job_id,
             "load_type": job.load_type,
         }
-    started = await drain_pool()
+    _schedule_drain()
     snap = pool.snapshot()
     return {
         "ok": True,
         "accepted": True,
         "job_id": job.job_id,
         "load_type": job.load_type,
-        "dispatched_now": started > 0 and job.job_id in pool.running,
+        "dispatched_now": job.job_id in pool.running,
         "oneoff_running": snap["oneoff_running"],
         "queued_by_type": snap["queued_by_type"],
     }
@@ -185,7 +244,7 @@ async def release_and_drain(job_id: str, *, kill_dyno: bool = False) -> None:
         handle = released.handle
         if isinstance(handle, dict) and handle.get("id"):
             await kill_oneoff_dyno(str(handle["id"]))
-    await drain_pool()
+    _schedule_drain()
 
 
 async def shutdown_dispatch() -> dict[str, int]:

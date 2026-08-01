@@ -10,7 +10,7 @@ import secrets
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, AsyncIterator
+from typing import Annotated, Any, AsyncIterator, Literal
 
 import httpx
 from dotenv import load_dotenv
@@ -250,21 +250,26 @@ def _pending_relay_max() -> int:
         return 500
 
 
+# Outcome of a coordinator POST: ok | permanent client error | transient failure.
+PostOutcome = Literal["ok", "gone", "retry"]
+
+
 async def _post_coordinator(
     path: str,
     body: dict[str, Any],
     *,
     attempts: int = 1,
-) -> bool:
-    """POST to Command. Returns True on 2xx/3xx. Never raises.
+) -> PostOutcome:
+    """POST to Command. Never raises.
 
-    Retries connection errors and 5xx with backoff. A 4xx is not retried: the
-    coordinator understood us and repeating the call cannot change the outcome.
+    - ``ok``: 2xx/3xx
+    - ``gone``: 4xx (Command rejected; do not buffer/retry — e.g. 409 job not active)
+    - ``retry``: 5xx / network after attempts exhausted
     """
     base = _coordinator_url()
     if not base:
         log.warning("COORDINATOR_URL unset; skip callback %s", path)
-        return False
+        return "retry"
     headers = {
         "Authorization": f"Bearer {_worker_token()}",
         "X-Worker-Id": _worker_id(),
@@ -276,7 +281,7 @@ async def _post_coordinator(
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(f"{base}{path}", json=body, headers=headers)
             if resp.status_code < 400:
-                return True
+                return "ok"
             if resp.status_code < 500:
                 log.error(
                     "Coordinator %s → %s %s (not retrying)",
@@ -284,7 +289,7 @@ async def _post_coordinator(
                     resp.status_code,
                     resp.text[:400],
                 )
-                return False
+                return "gone"
             log.warning(
                 "Coordinator %s → %s (attempt %s/%s)",
                 path,
@@ -303,7 +308,7 @@ async def _post_coordinator(
         if attempt < attempts:
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60.0)
-    return False
+    return "retry"
 
 
 async def _notify_load(*, reason: str = "heartbeat") -> None:
@@ -311,7 +316,7 @@ async def _notify_load(*, reason: str = "heartbeat") -> None:
     snap = _load_snapshot()
     if reason == "idle" and snap["load"] > 0:
         reason = "job_finished"
-    ok = await _post_coordinator(
+    outcome = await _post_coordinator(
         "/v1/workers/heartbeat",
         {
             "worker_id": _worker_id(),
@@ -319,7 +324,7 @@ async def _notify_load(*, reason: str = "heartbeat") -> None:
             **snap,
         },
     )
-    if ok:
+    if outcome == "ok":
         # Command may have forgotten us while it was down (restart / empty state).
         if not _coordinator_online:
             log.info("Coordinator reachable again; re-registering and flushing relays")
@@ -382,7 +387,7 @@ async def _register_with_coordinator() -> None:
 
 
 async def _relay_to_coordinator(job_id: str, body: dict[str, Any], *, fail: bool) -> bool:
-    """Forward a job result/failure. Buffers for retry if Command is unreachable."""
+    """Forward a job result/failure. Buffers only for transient Command outages."""
     path = (
         f"/v1/workers/jobs/{job_id}/fail"
         if fail
@@ -392,8 +397,12 @@ async def _relay_to_coordinator(job_id: str, body: dict[str, Any], *, fail: bool
     forward = {k: v for k, v in body.items() if k != "terminal"}
     if "worker_id" not in forward:
         forward["worker_id"] = _worker_id()
-    if await _post_coordinator(path, forward, attempts=_relay_attempts()):
+    outcome = await _post_coordinator(path, forward, attempts=_relay_attempts())
+    if outcome == "ok":
         return True
+    if outcome == "gone":
+        # 404/409 etc. — Command already dropped the lease; never buffer these.
+        return False
 
     limit = _pending_relay_max()
     if limit:
@@ -408,13 +417,28 @@ async def _relay_to_coordinator(job_id: str, body: dict[str, Any], *, fail: bool
 
 
 async def _flush_pending_relays() -> None:
-    """Drain buffered results once Command answers again."""
+    """Drain buffered results once Command answers again.
+
+    Permanent 4xx responses drop the entry so one dead job cannot block the queue.
+    """
     while _pending_relays:
         path, body = _pending_relays[0]
-        if not await _post_coordinator(path, body):
+        outcome = await _post_coordinator(path, body)
+        if outcome == "retry":
             return
         _pending_relays.popleft()
-        log.info("Flushed buffered relay path=%s pending=%s", path, len(_pending_relays))
+        if outcome == "ok":
+            log.info(
+                "Flushed buffered relay path=%s pending=%s",
+                path,
+                len(_pending_relays),
+            )
+        else:
+            log.warning(
+                "Dropped buffered relay path=%s (Command rejected) pending=%s",
+                path,
+                len(_pending_relays),
+            )
 
 
 @asynccontextmanager
@@ -690,7 +714,8 @@ async def command_scrape(
         payload=body.model_dump(),
     )
     result = await enqueue_and_drain(job)
-    await _notify_load(reason="heartbeat")
+    # Do not block 202 on coordinator round-trip; heartbeat loop will refresh load.
+    asyncio.create_task(_notify_load(reason="heartbeat"), name="load-notify-scrape")
     return result
 
 
@@ -704,7 +729,9 @@ async def command_stream_status(
         payload=body.model_dump(),
     )
     result = await enqueue_and_drain(job)
-    await _notify_load(reason="heartbeat")
+    asyncio.create_task(
+        _notify_load(reason="heartbeat"), name="load-notify-stream-status"
+    )
     return result
 
 
@@ -728,7 +755,7 @@ async def command_transcript(
         payload=payload,
     )
     result = await enqueue_and_drain(job)
-    await _notify_load(reason="heartbeat")
+    asyncio.create_task(_notify_load(reason="heartbeat"), name="load-notify-transcript")
     return result
 
 
