@@ -70,9 +70,11 @@ Command → worker command pushes use the same bearer on the worker’s `/v1/com
 - Advertise `capacity` / `oneoff_limit` ≈ max parallel one-offs (e.g. 50).
 - `base_url` must be reachable from Command (no trailing slash required; Command strips it).
 
-### 3.2 Heartbeat (~every 15–30s)
+### 3.2 Heartbeat (~every 60s)
 
 `POST {COORDINATOR_URL}/v1/workers/heartbeat`
+
+Worker default: `WORKER_HEARTBEAT_SECONDS=60`.
 
 ```json
 {
@@ -109,9 +111,14 @@ Command → worker command pushes use the same bearer on the worker’s `/v1/com
 
 Command may return `dispatch` with more scrape work when slots are free. Process it; do not require `load === 0`.
 
-### 3.3 Cancel (optional)
+### 3.3 Cancel
 
-If Command later adds cancel pushes, honor `POST /v1/commands/cancel` on the worker. Until then, lease expiry + fail/result still apply.
+Worker accepts cancel pushes today:
+
+- `POST {WORKER_PUBLIC_URL}/v1/commands/{job_id}/cancel`
+- `POST {WORKER_PUBLIC_URL}/v1/commands/cancel` with `{"job_id":"..."}`
+
+Cancels queued work or kills a running one-off when possible. Lease expiry + fail/result still apply if cancel races a completion.
 
 ---
 
@@ -140,7 +147,8 @@ Content-Type: application/json
     "youtube_fallback": {
       "channel_url": "https://www.youtube.com/@CityOfAustinTX/streams",
       "on_primary_failure": "same_day_stub",
-      "match": "title_date"
+      "match": "title_date",
+      "require_title_match": true
     }
   }
 }
@@ -148,9 +156,12 @@ Content-Type: application/json
 
 **Worker must**
 
-1. Return **202** immediately after queueing (preferred for Playwright / one-offs).
+1. Return **202** immediately after queueing (preferred for Playwright / one-offs). Do not await Heroku spawn or Playwright on the accept path.
 2. Run scrape on a one-off / thread.
 3. POST results to `callback_url` (or `/v1/workers/jobs/{job_id}/fail`).
+4. Treat Command **4xx** on result/fail (e.g. `409 job not active`) as permanent — do **not** buffer/retry those forever on heartbeat.
+
+**Mode resolution (worker):** `mode=auto` + `schedule_type` set → dedicated parser only. LLM runs only when `mode=llm`, or `mode=auto` with **no** `schedule_type`. Dedicated failure does **not** fall through to LLM; optional `youtube_fallback` may still run.
 
 Calendar-style scrape body may look like:
 
@@ -170,13 +181,22 @@ Calendar-style scrape body may look like:
 }
 ```
 
-#### `require_title_match` (calendar sources)
+#### `require_title_match` (all YouTube handling)
+
+Command always sets `require_title_match: true` whenever it includes a
+`youtube_fallback`, including YouTube-first, YouTube-only, and
+calendar-then-YouTube requests. Workers must not fall back to date-only matching
+for requests from Command.
 
 On a calendar scrape the calendar owns the meeting list, and the channel is only
 used to attach a video to a meeting that already exists. When
 `require_title_match` is true the worker must attach a video **only** when the
 video title matches the meeting title as well as the date. Matching on date
 alone pins the same video onto every meeting held that day, which is wrong.
+
+This applies to **every** calendar `schedule_type` (`civicclerk_table`,
+`primegov_table`, `wordpress_table`, and any other dedicated calendar parser) —
+not one vendor alone.
 
 Title matching evaluates all of these strategies and uses the strongest safe
 match: normalized exact match, phrase containment, keyword intersection,
@@ -196,6 +216,25 @@ video date must come from YouTube's structured `ytInitialData` card metadata:
 modern `metadataParts` or legacy `publishedTimeText` (`scheduled_time` for
 upcoming, `published_time` for live/concluded). Never infer the video date from
 numbers or date-looking text in its title.
+
+Expected unmatched calendar meeting (any vendor) — **omit** video fields entirely
+(do not send `null` / empty / channel / guessed values):
+
+```json
+{
+  "Meeting name": "Planning and Zoning Commission",
+  "Scheduled time": "2026-08-05T22:00:00Z",
+  "Status": "Upcoming",
+  "Agenda link": "https://example.gov/meetings/123/agenda",
+  "user_live_link": "https://example.gov/meetings/123"
+}
+```
+
+`user_live_link` remains the calendar/portal event page (CivicClerk media page,
+PrimeGov event page, WordPress meeting page, etc.). It is not a playable stream
+and must not be copied into `Meeting link`. If a title-and-date match is later
+found, the matched result may add the YouTube `Meeting link`, `video_id`, and
+`Stream type` while preserving `user_live_link`.
 
 ### Unified YouTube architecture
 
@@ -337,7 +376,14 @@ calendar scrape itself fails and the channel becomes the source of meetings.
 | `upcoming` / `scheduled` | upcoming | continues |
 | `fetch_failed` / `unknown` | *(ignore / keep lease)* | **continues** — page could not be read; do **not** treat as adjourned |
 | `concluded` / `adjourned` / `ended` / `timeout` | adjourned | **done** |
-| **`skipped`** | adjourned | **done** (e.g. 24/7 stream — do **not** keep polling) |
+| **`skipped`** | **no status change** | **done** (e.g. 24/7 stream — do **not** keep polling) |
+
+#### `skipped` does not adjourn the meeting
+
+`skipped` ends the poll job, but Command leaves the meeting status untouched and
+does **not** queue a transcript. Declining to watch a stream is not evidence the
+meeting ended. The next scrape of that source resolves real status from the
+channel page.
 
 `fetch_failed` is returned when ytInitialData is missing/blocked after a poll.
 Command should renew the lease and wait for the next poll — never mark the
@@ -347,6 +393,19 @@ meeting adjourned from a failed fetch alone. Successful absence of the owned
 Poll results may include `started_streaming_on`, `published_time`,
 `skipped_videos`, and `match_diagnostics` (video-id continuity / candidate
 counts). Title and date remain independent fields.
+
+#### Worker requirement — accurate live start time for the skip guard
+
+The “live stream older than 24h” guard (`YOUTUBE_MAX_LIVE_AGE_HOURS`, default 24)
+must use the watch page’s real start timestamp:
+
+`ytInitialPlayerResponse.microformat.playerMicroformatRenderer.liveBroadcastDetails.startTimestamp`
+
+Do **not** use `publishDate` (broadcast created date) or unrelated
+“Started streaming on …” strings scraped from channel/`ytInitialData` card text —
+those misfire on discrete meetings (observed 2026-07-30: same-day lives reported
+as Dec 2023 / Jun–Jul 2026 from wrong elements). Only skip when
+`startTimestamp` is genuinely more than 24h old.
 
 Example final (skipped):
 
@@ -380,7 +439,7 @@ Example final (concluded):
 }
 ```
 
-After adjourned/concluded, Command marks the meeting **transcript-eligible** and may dispatch a transcript job.
+After adjourned/concluded, Command marks the meeting **transcript-eligible** and may dispatch a transcript job. A `skipped` result does not.
 
 ---
 
@@ -502,7 +561,8 @@ curl -X POST "$COORDINATOR_URL/v1/workers/transcripts" \
   -F "meeting_id=austin-tx:e7l6sylixl0" \
   -F "video_id=E7l6sYLIXl0" \
   -F "language=en" \
-  -F "text=optional plain text dump of cues"
+  -F "text=optional plain text dump of cues" \
+  -F 'cues=[{"start":0,"text":"Opening remarks…","duration":3.2},{"start":9,"text":"Next item…"}]'
 ```
 
 Rules:
@@ -510,7 +570,14 @@ Rules:
 - Provide **`meeting_id` and/or `video_id`** (Command resolves either).
 - `file` must be a real PDF (`%PDF` magic or `.pdf` / `application/pdf`).
 - Optional `text` = concatenated cue text for search/debug.
-- On success Command sets `has_transcript`, stores PDF, updates feed `transcript_url`.
+- Optional `cues` = JSON array of timed segments for public-feed clips:
+  `[{"start": 12.5, "text": "…", "duration": 3.2}, …]`
+  (`duration` optional; also accepted if `text` lines look like `0:09 spoken words`).
+- On success Command sets `has_transcript`, stores PDF, updates feed `transcript_url`,
+  and persists cues when provided.
+
+There is **no** separate “clip” command. Clips use the same transcript upload path
+via the `cues` field (receive → process → return is covered by §6.1–6.4).
 
 ### 6.4 Worker → Command (failure)
 
@@ -567,14 +634,16 @@ Loosen worker cold-start: accept fast (202), do heavy work async.
 ## 9. Checklist before go-live
 
 - [ ] Register with `capacity` / `oneoff_limit` ≈ 50 (not hard-coded 1).
-- [ ] Heartbeat reports `oneoff_running`, `queued_by_type`, `load_by_type`.
-- [ ] All three commands return **202** when queued.
+- [ ] Heartbeat ~60s reports `oneoff_running`, `queued_by_type`, `load_by_type`.
+- [ ] All three commands return **202** when queued (accept path does not await spawn).
 - [ ] Scrape result posts meetings; adjourned + video_id feeds transcript queue.
-- [ ] Calendar `youtube_fallback.require_title_match` attaches video only on title+date match.
-- [ ] Monitor posts polls; **`skipped`** ends the job (no infinite loop).
+- [ ] Every `youtube_fallback` uses `require_title_match: true` (title+date only).
+- [ ] Unmatched calendar meetings omit `Meeting link` / `video_id` / `Stream type`; portal URL stays in `user_live_link`.
+- [ ] Monitor posts polls; **`skipped`** ends the job (no infinite loop) and does **not** adjourn / queue transcript.
+- [ ] Skip guard uses watch-page `liveBroadcastDetails.startTimestamp` (not publishDate / wrong card text).
 - [ ] Monitor treats **`fetch_failed` / `unknown`** as non-terminal (keep lease; do not adjourn).
 - [ ] Dates never come from video titles — only structured YouTube card metadata.
-- [ ] Transcript: Innertube → TranscriptAPI → PDF → multipart upload.
+- [ ] Transcript: Innertube → TranscriptAPI → PDF → multipart upload including optional `cues` JSON.
 - [ ] Transcript fail posts to `/v1/workers/transcripts/fail` (set `rate_limited` / `reason` when appropriate).
 - [ ] Same `WORKER_SHARED_TOKEN` on Command and worker; `COORDINATOR_URL` / `WORKER_PUBLIC_URL` correct.
 - [ ] No Command calls to one-off dyno URLs.
@@ -605,4 +674,4 @@ curl -sS -o /dev/null -w "%{http_code}\n" -X POST "$WORKER_PUBLIC_URL/v1/command
 
 ---
 
-*Aligned with sentinel-license coordinator as of 2026-07-29: pool capacity, 202=accepted, skipped=terminal, worker PDF transcripts, require_title_match, transcript fail `reason`.*
+*Aligned with sentinel-license coordinator + scrape-worker as of 2026-08-06: pool capacity, 202=accepted, skipped=terminal (no adjourn), require_title_match on all youtube_fallback, transcript fail `reason`, transcript multipart `cues` for feed clips (no separate clip job).*

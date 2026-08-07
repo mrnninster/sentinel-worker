@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import re
 from io import BytesIO
@@ -128,7 +129,35 @@ def _parse_panel_cues(data: dict[str, Any]) -> list[dict[str, Any]]:
                         pass
                     break
         cues.append({"start": start, "text": text.strip()})
-    return cues
+    return _with_cue_durations(cues)
+
+
+def _with_cue_durations(cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fill missing duration as gap to next cue start (last cue left without duration)."""
+    out: list[dict[str, Any]] = []
+    for idx, cue in enumerate(cues):
+        row = {
+            "start": float(cue.get("start") or 0),
+            "text": str(cue.get("text") or "").strip(),
+        }
+        if not row["text"]:
+            continue
+        duration = cue.get("duration")
+        if duration is None and idx + 1 < len(cues):
+            try:
+                nxt = float(cues[idx + 1].get("start") or 0)
+                gap = nxt - row["start"]
+                if gap > 0:
+                    duration = gap
+            except (TypeError, ValueError):
+                duration = None
+        if duration is not None:
+            try:
+                row["duration"] = float(duration)
+            except (TypeError, ValueError):
+                pass
+        out.append(row)
+    return out
 
 
 def _build_panel_params(video_id: str) -> str:
@@ -244,14 +273,26 @@ def fetch_transcript_api(
         )
     data = response.json()
     rows = data if isinstance(data, list) else data.get("transcript") or data.get("segments") or []
-    cues = [
-        {"start": float(row.get("start") or 0), "text": str(row.get("text") or "").strip()}
-        for row in rows
-        if isinstance(row, dict) and str(row.get("text") or "").strip()
-    ]
+    cues = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        text = str(row.get("text") or "").strip()
+        if not text:
+            continue
+        item: dict[str, Any] = {
+            "start": float(row.get("start") or 0),
+            "text": text,
+        }
+        if row.get("duration") is not None:
+            try:
+                item["duration"] = float(row["duration"])
+            except (TypeError, ValueError):
+                pass
+        cues.append(item)
     if not cues:
         raise TranscriptError("TranscriptAPI returned no transcript cues", reason="no_captions")
-    return cues
+    return _with_cue_durations(cues)
 
 
 def fetch_transcript(
@@ -354,6 +395,7 @@ def upload_pdf(
     video_id: str,
     language: str,
     text: str,
+    cues: list[dict[str, Any]] | None = None,
 ) -> None:
     if not url:
         raise TranscriptError("Transcript callback_url is missing")
@@ -361,12 +403,30 @@ def upload_pdf(
         "Authorization": f"Bearer {token}",
         "X-Worker-Id": worker_id,
     }
-    data = {
+    data: dict[str, str] = {
         "meeting_id": meeting_id or "",
         "video_id": video_id,
         "language": language,
         "text": text,
     }
+    if cues:
+        # Command persists timed segments for public-feed clips.
+        data["cues"] = json.dumps(
+            [
+                {
+                    "start": float(c.get("start") or 0),
+                    "text": str(c.get("text") or ""),
+                    **(
+                        {"duration": float(c["duration"])}
+                        if c.get("duration") is not None
+                        else {}
+                    ),
+                }
+                for c in cues
+                if str(c.get("text") or "").strip()
+            ],
+            separators=(",", ":"),
+        )
     files = {"file": (f"{video_id}.pdf", pdf, "application/pdf")}
     with httpx.Client(timeout=180.0) as client:
         response = client.post(url, headers=headers, data=data, files=files)
@@ -441,6 +501,7 @@ def run_transcript_job(payload: dict[str, Any], env: dict[str, str], worker_id: 
         video_id=video_id,
         language=str(payload.get("language") or "en"),
         text=text,
+        cues=cues,
     )
     return {
         "worker_id": worker_id,
