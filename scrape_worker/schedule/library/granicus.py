@@ -222,9 +222,16 @@ class Granicus:
                                 clean_meeting_date_time = re.sub(
                                     r"[^\w\s]", "", meeting_date_time
                                 ).lower()
-                                meeting_date_time = self.parse_and_localize_datetime(
-                                    meeting_date_time, timezone
-                                )
+                                try:
+                                    meeting_date_time = self.parse_and_localize_datetime(
+                                        meeting_date_time, timezone
+                                    )
+                                except (ValueError, OverflowError):
+                                    # Player labels and other non-date cells are not meetings.
+                                    print(
+                                        f"skipping row with no date => {raw_meeting_date_time}"
+                                    )
+                                    continue
 
                                 if match:
                                     meeting_date_time = meeting_date_time.replace(
