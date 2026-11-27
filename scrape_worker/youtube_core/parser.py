@@ -15,7 +15,10 @@ from youtube_core.models import StreamCard
 
 log = logging.getLogger(__name__)
 
-_SCHEDULED_FOR_RE = re.compile(r"Scheduled for\s+(.+)", re.IGNORECASE)
+_SCHEDULED_FOR_RE = re.compile(
+    r"(?:Scheduled for|Premieres)\s+(.+)",
+    re.IGNORECASE,
+)
 _STARTED_STREAMING_ON_RE = re.compile(
     r"Started streaming on\s+(.+?)(?:\s*[·|]|\s*$)",
     re.IGNORECASE,
@@ -31,7 +34,7 @@ _YOUTUBE_RELATIVE_DATE_RE = re.compile(
 )
 _YOUTUBE_PAGE_DATE_PREFIX_RE = re.compile(
     r"^(?:scheduled for|started streaming on|streamed live on|streamed on|"
-    r"streamed live|streamed|premiered on|premiered|published on|published)\s+",
+    r"streamed live|streamed|premieres|premiered on|premiered|published on|published)\s+",
     re.IGNORECASE,
 )
 
@@ -164,7 +167,8 @@ class StreamCardParser:
     @classmethod
     def _lockup_schedule_text(cls, meta_vm: dict) -> str:
         for content in cls._lockup_metadata_texts(meta_vm):
-            if content.lower().startswith("scheduled for"):
+            lowered = content.lower()
+            if lowered.startswith("scheduled for") or lowered.startswith("premieres"):
                 return content
         return ""
 
@@ -181,6 +185,7 @@ class StreamCardParser:
                     "started streaming ",
                     "streamed ",
                     "streamed live ",
+                    "premieres ",
                     "premiered ",
                     "published ",
                 )

@@ -29,6 +29,19 @@ def test_lockup_live_and_relative_published_time(tz):
     assert 1.0 < age_days < 3.5
 
 
+def test_lockup_upcoming_premieres_is_case_insensitive(tz):
+    item = lockup_card(
+        video_id="PREMIERE001",
+        title="2026 Varsity Football: District Semifinals",
+        badge="Upcoming",
+        metadata_parts=["pReMiErEs 11/27/26, 4:00\u202fPM"],
+    )
+    card = StreamCardParser.classify_rich_item(item, timezone=tz)
+    assert card is not None
+    assert card.status == "upcoming"
+    assert card.scheduled_time == "2026-11-27T21:00:00Z"
+
+
 def test_lockup_upcoming_scheduled_for(tz):
     item = lockup_card(
         video_id="ABCDEFGHIJK",
